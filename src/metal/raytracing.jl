@@ -57,6 +57,10 @@ mutable struct MetalTLAS{Tri} <: HWTLAS{Tri}
     scratch::MTL.MTLBuffer
     refittable::Bool
     count::Int
+    function MetalTLAS{Tri}(handle, desc, blases, instances, scratch, refittable, count) where {Tri}
+        t = new{Tri}(handle, desc, blases, instances, scratch, refittable, count)
+        return finalizer(freebuffers!, t)
+    end
 end
 
 """
@@ -72,6 +76,50 @@ mutable struct MetalBLAS
     desc::Any
     scratch::MTL.MTLBuffer
     refittable::Bool
+    function MetalBLAS(handle, desc, scratch, refittable)
+        b = new(handle, desc, scratch, refittable)
+        return finalizer(freebuffers!, b)
+    end
+end
+
+"""
+The buffers a structure owns, back to the device when it is collected.
+
+`MTLBuffer` is an unmanaged wrapper, so nothing releases one unless asked.
+`Metal.free` is finalizer-safe, which is why this can run from one.
+"""
+freebuffers!(b::MetalBLAS) = (Metal.free(b.scratch); nothing)
+freebuffers!(t::MetalTLAS) = (Metal.free(t.scratch); Metal.free(t.instances); nothing)
+
+"""
+    newstructure(dev, bytes) -> MTLAccelerationStructure
+
+An empty acceleration structure that leaves the residency set when it is collected.
+
+[`make_resident!`](@ref) puts every structure a traversal reaches into the
+queue's residency set, and a set holds a strong reference to what is in it, so a
+structure still in the set outlives every Julia reference to it. The finalizer
+is on the structure rather than on the `MetalBLAS` or `MetalTLAS` holding it,
+because a TLAS keeps its instances' structures alive without their `MetalBLAS`.
+"""
+function newstructure(d::MetalDevice, bytes::Integer)
+    accel = MTL.alloc_acceleration_structure(d.dev, bytes)
+    return finalizer(Metal.forget_resident!, accel)
+end
+
+"""
+Build `desc` into `accel` with scratch that is freed as soon as the build has run.
+"""
+function buildstructure!(d::MetalDevice, accel, desc, scratchbytes::Integer)
+    scratch = MTL.MTLBuffer(d.dev, max(scratchbytes, 1); storage = Metal.PrivateStorage)
+    try
+        withaccelencoder(d) do enc
+            MTL.build!(enc, accel, desc, scratch)
+        end
+    finally
+        Metal.free(scratch)
+    end
+    return accel
 end
 
 """
@@ -81,7 +129,7 @@ Builds are one-off setup rather than per-frame work, so this synchronises rather
 than threading them through the graph's timeline. When acceleration-structure
 builds move into a pass, this becomes an encoder the graph hands over.
 """
-function withaccelencoder(f, d::MetalDevice)
+@autoreleasepool function withaccelencoder(f, d::MetalDevice)
     cb = MTL.MTLCommandBuffer(cmdqueue(d))
     enc = MTL.MTLAccelerationStructureCommandEncoder(cb)
     try
@@ -107,8 +155,8 @@ a refit and Metal rejects one. Note that a refittable structure may still report
 `refitScratchBufferSize == 0` — that means "no scratch needed", not "no refit
 allowed", which is why the permission is tracked as a flag.
 """
-function build_blas(d::MetalDevice, vertices::MTL.MTLBuffer, ntriangles::Integer;
-                    stride::Integer = 12, refittable::Bool = false)
+@autoreleasepool function build_blas(d::MetalDevice, vertices::MTL.MTLBuffer, ntriangles::Integer;
+                                     stride::Integer = 12, refittable::Bool = false)
     geo = MTL.MTLAccelerationStructureTriangleGeometryDescriptor()
     geo.vertexBuffer = vertices
     geo.vertexStride = stride
@@ -119,12 +167,8 @@ function build_blas(d::MetalDevice, vertices::MTL.MTLBuffer, ntriangles::Integer
     refittable && (desc.usage = MTL.MTLAccelerationStructureUsageRefit)
 
     sizes = MTL.accelerationStructureSizes(d.dev, desc)
-    accel = MTL.alloc_acceleration_structure(d.dev, sizes.accelerationStructureSize)
-    scratch = MTL.MTLBuffer(d.dev, max(sizes.buildScratchBufferSize, 1);
-                            storage = Metal.PrivateStorage)
-    withaccelencoder(d) do enc
-        MTL.build!(enc, accel, desc, scratch)
-    end
+    accel = buildstructure!(d, newstructure(d, sizes.accelerationStructureSize), desc,
+                            sizes.buildScratchBufferSize)
     keep = MTL.MTLBuffer(d.dev, max(sizes.refitScratchBufferSize, 1);
                          storage = Metal.PrivateStorage)
     return MetalBLAS(accel, desc, keep, refittable)
@@ -178,8 +222,8 @@ is never opaque in the sense a triangle is, because there is nothing to intersec
 until an intersection function says so. The flag exists so a caller spells the build
 the same way on both backends.
 """
-function Mantle.build_blas_aabb(ctx::MetalAccelBuildContext,
-                                aabbs::Vector{Mantle.AABB}; opaque::Bool = true)
+@autoreleasepool function Mantle.build_blas_aabb(ctx::MetalAccelBuildContext,
+                                                 aabbs::Vector{Mantle.AABB}; opaque::Bool = true)
     d = ctx.device
     n = length(aabbs)
     n > 0 || throw(ArgumentError("build_blas_aabb: no boxes to build over"))
@@ -208,17 +252,15 @@ function Mantle.build_blas_aabb(ctx::MetalAccelBuildContext,
     desc.geometryDescriptors = NSArray([geo])
 
     sizes = MTL.accelerationStructureSizes(d.dev, desc)
-    accel = MTL.alloc_acceleration_structure(d.dev, sizes.accelerationStructureSize)
-    scratch = MTL.MTLBuffer(d.dev, max(sizes.buildScratchBufferSize, 1);
-                            storage = Metal.PrivateStorage)
-    withaccelencoder(d) do enc
-        MTL.build!(enc, accel, desc, scratch)
-    end
+    accel = buildstructure!(d, newstructure(d, sizes.accelerationStructureSize), desc,
+                            sizes.buildScratchBufferSize)
     keep = MTL.MTLBuffer(d.dev, max(sizes.refitScratchBufferSize, 1);
                          storage = Metal.PrivateStorage)
-    # The box buffer has to outlive the build: the structure references it.
+    # The box buffer has to outlive the build: the structure references it. The
+    # geometry descriptor holds its own reference, and `desc` lives as long as the
+    # `MetalBLAS`, so this one is let go.
     blas = MetalBLAS(accel, desc, keep, false)
-    push!(ctx.preserves, buf)
+    Metal.free(buf)
     return blas
 end
 
@@ -231,10 +273,10 @@ Build a top-level structure over `blases`, one instance per transform.
 [`packedtransform`](@ref) — see the note at the top of this file about why they
 cannot simply be copied.
 """
-function build_accel!(d::MetalDevice, blases::Vector{MetalBLAS},
-                      transforms::Vector{Mat3x4f}; refittable::Bool = false,
-                      ids::Union{Nothing,Vector{UInt32}} = nothing,
-                      masks::Union{Nothing,Vector{UInt8}} = nothing)
+@autoreleasepool function build_accel!(d::MetalDevice, blases::Vector{MetalBLAS},
+                                       transforms::Vector{Mat3x4f}; refittable::Bool = false,
+                                       ids::Union{Nothing,Vector{UInt32}} = nothing,
+                                       masks::Union{Nothing,Vector{UInt8}} = nothing)
     n = length(transforms)
     n == length(blases) || throw(ArgumentError(
         "build_accel!: $(length(blases)) structures but $n transforms; each " *
@@ -273,12 +315,8 @@ function build_accel!(d::MetalDevice, blases::Vector{MetalBLAS},
     refittable && (desc.usage = MTL.MTLAccelerationStructureUsageRefit)
 
     sizes = MTL.accelerationStructureSizes(d.dev, desc)
-    accel = MTL.alloc_acceleration_structure(d.dev, sizes.accelerationStructureSize)
-    scratch = MTL.MTLBuffer(d.dev, max(sizes.buildScratchBufferSize, 1);
-                            storage = Metal.PrivateStorage)
-    withaccelencoder(d) do enc
-        MTL.build!(enc, accel, desc, scratch)
-    end
+    accel = buildstructure!(d, newstructure(d, sizes.accelerationStructureSize), desc,
+                            sizes.buildScratchBufferSize)
     # `max(…, 1)`: Metal wants a buffer even when it needs no bytes of it, and
     # a zero-length `MTLBuffer` is rejected.
     keep = MTL.MTLBuffer(d.dev, max(sizes.refitScratchBufferSize, 1);
@@ -297,7 +335,7 @@ cheaper than a rebuild — the point of holding a HWTLAS across frames — but i
 not re-cluster, so instances that move far enough degrade traversal until they
 are rebuilt.
 """
-function refit_tlas!(d::MetalDevice, tlas::MetalTLAS, transforms::Vector{Mat3x4f})
+@autoreleasepool function refit_tlas!(d::MetalDevice, tlas::MetalTLAS, transforms::Vector{Mat3x4f})
     length(transforms) == tlas.count || throw(ArgumentError(
         "refit_tlas!: built with $(tlas.count) instances, given $(length(transforms)); " *
         "a refit cannot change the instance count — rebuild instead"))

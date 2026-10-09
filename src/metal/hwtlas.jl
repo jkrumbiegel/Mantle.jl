@@ -114,13 +114,16 @@ end
 # residency set per command queue; acceleration structures reached through an
 # argument buffer are exactly the case where Metal cannot infer residency, and
 # the failure mode without this is a silent miss rather than an error.
+#
+# Through Metal.jl's own bookkeeping rather than `add_allocation!` on the set: a
+# set holds a strong reference to everything in it, and only an allocation
+# Metal.jl knows about is taken back out when it is freed (`forget_resident!`).
 function make_resident!(d::MetalDevice, resources...)
-    resset = Metal.install_queue_residency!(cmdqueue(d), d.dev)
+    Metal.install_queue_residency!(cmdqueue(d), d.dev)
     for r in resources
         r === nothing && continue
-        MTL.add_allocation!(resset, r)
+        Metal.make_persistently_resident!(r, d.dev)
     end
-    MTL.commit!(resset)
     return nothing
 end
 
@@ -382,6 +385,8 @@ function add_geometry!(t::MetalHWTLAS{Tri}, mesh::GeometryBasics.Mesh) where {Tr
     vbuf = MTL.MTLBuffer(t.device.dev, sizeof(flat); storage = Metal.SharedStorage)
     unsafe_copyto!(convert(Ptr{Float32}, MTL.contents(vbuf)), pointer(flat), length(flat))
     blas = build_blas(t.device, vbuf, n_tris)
+    # The BLAS descriptor holds its own reference to the vertices, for a refit.
+    Metal.free(vbuf)
 
     push!(t.blas_list, blas)
     push!(t.blas_triangles, cpu_triangles)
