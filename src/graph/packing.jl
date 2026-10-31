@@ -60,6 +60,36 @@ function passedslots(types)
     return slots
 end
 
+function packed_stores!(stores, T, value, offset)
+    sizeof(T) == 0 && return stores
+    if isprimitivetype(T) || !Base.datatype_haspadding(T)
+        push!(stores, :(unsafe_store!(Ptr{$T}(p + $offset), $value)))
+    else
+        for i in 1:fieldcount(T)
+            packed_stores!(stores, fieldtype(T, i), :(getfield($value, $i)), offset + Int(fieldoffset(T, i)))
+        end
+    end
+    return stores
+end
+
+"""
+    storebits!(p, x) -> nothing
+
+Store isbits `x` at `p`, field by field where it has padding, so the padding keeps
+the bytes `p` held. `unsafe_store!` of a padded struct leaves them undefined, in
+practice whatever the stack held: packing the same values twice wrote different
+bytes, and a re-recorded plan's arguments changed though nothing in them had.
+"""
+@generated function storebits!(p::Ptr{UInt8}, x::T) where {T}
+    # Flatten at generation time. Recursive storebits! calls can hit inference's
+    # recursion limit on nested descriptors and box their pointer fields.
+    stores = packed_stores!(Expr[], T, :x, 0)
+    return quote
+        $(stores...)
+        nothing
+    end
+end
+
 """
     eachpassedarg(f, args) -> Int
 
@@ -119,19 +149,46 @@ resolved at specialisation; empty for non-isbits types.
 end
 
 """
-    notepacked!(plan, T, at, target, off)
+    PatchSite(plan, target, base)
 
-Register in `plan.patchtab` each nonzero device pointer of a `T` packed at host
-address `at`, i.e. at byte `off` of `target`, for `notify_move!`. A no-op for
-types without pointers.
+Where a recording packs bytes: into `target` (memory the backend's `emitinline!`
+writes), whose first byte is at host address `base`. A backend's packer hands each
+value it writes to [`notepacked!`](@ref) with the site; a pack that is not recorded
+passes `nothing`, since nothing replays it.
 """
-@inline function notepacked!(pl, ::Type{T}, at::Ptr{UInt8}, target, off::Int) where {T}
+struct PatchSite{T}
+    plan::Plan
+    target::T
+    base::Ptr{UInt8}
+end
+
+"""
+    notepacked!(site, T, at)
+
+Register in the plan's `patchtab` each nonzero device pointer of a `T` packed at
+host address `at` inside the site, for `notify_move!`. A no-op for types without
+pointers and for `site === nothing`.
+"""
+@inline function notepacked!(s::PatchSite, ::Type{T}, at::Ptr{UInt8}) where {T}
     fields = devicepointeroffsets(T)
     isempty(fields) && return nothing
     for f in fields
-        addr = unsafe_load(Ptr{UInt64}(at + f))
-        addr == 0 && continue
-        push!(get!(Vector{Tuple{Any,Int}}, pl.patchtab, addr), (target, off + f))
+        notepointer!(s, at + f)
     end
     return nothing
 end
+notepacked!(::Nothing, ::Type, ::Ptr{UInt8}) = nothing
+
+"""
+    notepointer!(site, at)
+
+Register the device address stored at host address `at`, when nonzero: a packed
+slot that holds an allocation's address rather than a value's bytes.
+"""
+function notepointer!(s::PatchSite, at::Ptr{UInt8})
+    addr = unsafe_load(Ptr{UInt64}(at))
+    addr == 0 && return nothing
+    push!(get!(Vector{Tuple{Any,Int}}, s.plan.patchtab, addr), (s.target, Int(at - s.base)))
+    return nothing
+end
+notepointer!(::Nothing, ::Ptr{UInt8}) = nothing

@@ -145,6 +145,16 @@ end
 
     # SPIR-V's builtins are 0-based and KI's are 1-based, so every one of these
     # is a `+ 1` that has to be there exactly once.
+    @testset "a plain function launches on the backend its array reports" begin
+        # `KI.get_backend` of an `MtlArray` is Metal.jl's backend, not the device;
+        # a kernel built around a plain function launches there too. On Metal
+        # this was ambiguous with Metal.jl's methods for its compiled kernels.
+        a = Mantle.devicearray(backend, zeros(Float32, 5))
+        KI.Kernel(KI.get_backend(a), ki_fill_kernel)(a; ndrange = length(a))
+        KI.synchronize(backend)
+        @test Array(a) == ones(Float32, 5)
+    end
+
     @testset "indexing is 1-based" begin
         n, wg = 64, 16
 
@@ -201,7 +211,9 @@ end
         # Answered from the device, so the assertions are on shape, plausibility
         # and agreement with `Mantle.caps` rather than on a number this machine
         # happens to report.
-        @test KI.get_backend(Mantle.devicearray(backend, zeros(Float32, 1))) isa typeof(backend)
+        # `==`, not the type: an `MtlArray` reports Metal.jl's backend, which
+        # equals the device it lives on.
+        @test KI.get_backend(Mantle.devicearray(backend, zeros(Float32, 1))) == backend
         @test KI.supports_unified(backend)
         # Mantle's own kernels use Atomix on every backend
         # (`test_atomics_and_dispatch.jl`); a backend answering `false` here is
@@ -239,7 +251,7 @@ end
         # `allocate` goes through the same path as `KA.allocate`.
         b = KI.allocate(backend, Float32, (8,))
         @test b isa AbstractVector{Float32}
-        @test KI.get_backend(b) isa typeof(backend)
+        @test KI.get_backend(b) == backend
         @test size(b) == (8,)
     end
 

@@ -19,38 +19,67 @@ kernelinterpreter(::LavaDevice, kernel, tt) = Lava.kernelinterpreter(kernel, tt)
 # `group` (a 1-D and a 2-D ndrange give different `CompilerMetadata`), and the
 # kernel is inferred at the plan's workgroup size.
 function kakernelaccesssignature(dev::LavaDevice, kernel, argT::Tuple, ndrange, group)
-    obj  = kernelfor(kernel, group, backend(dev))
+    obj  = kernelfor(kernel, group, dev)
     iter = get_or_build_iter_plan(obj, dispatchrange(ndrange), callgroup(obj, group), dev)
-    tt   = (typeof(iter.ka_ctx), argT...)
+    return kaaccesssignature(obj, iter, argT)
+end
+
+"""The signature a built KA kernel's accesses are inferred at, for iteration plan `iter`."""
+function kaaccesssignature(obj, iter::IterPlan, argT::Tuple)
+    tt     = (typeof(iter.ka_ctx), argT...)
     interp = Lava.kernelinterpreter(obj.f, Tuple{tt...}; workgroup_size = iter.ws_3d)
     return interp, obj.f, tt
 end
 
+# A KA kernel is inferred at its launch's workgroup size, which Lava compiles in;
+# the launch is flat (`get_or_build_iter_plan`).
+kernelinterpreter(::LavaDevice, kernel, tt, threads::Integer) =
+    Lava.kernelinterpreter(kernel, tt; workgroup_size = (Int(threads), 1, 1))
+
+"""
+    cachedtouches(dev, sig, skip) -> view or nothing
+
+What the walk already found for `sig`, past its first `skip` entries (the kernel
+function, and a KA kernel's iteration context). An eager launch asks on every call,
+and building the interpreter and walk again only to reach this entry allocated more
+than the rest of the launch (`test_dispatch_allocation.jl`).
+"""
+function cachedtouches(dev::LavaDevice, @nospecialize(sig::Type), skip::Int)
+    summary = get(summaries!(accesscache(dev)), sig, nothing)
+    summary === nothing && return nothing
+    holds(summary, Base.get_world_counter()) || return nothing
+    touches = summary.touches
+    return view(touches, (skip + 1):length(touches))
+end
+
+"""
+What an eagerly launched KA kernel does to each of `args` at iteration plan `iter`.
+The graph path asks `argument_usage` with the kernel's constructor; an eager launch
+only has the built kernel.
+"""
+function katouches(obj::KA.Kernel{LavaDevice}, args::Tuple, iter::IterPlan)
+    dev = obj.backend
+    argT = map(a -> devicetype(dev, a), args)
+    cached = cachedtouches(dev, Tuple{typeof(obj.f), typeof(iter.ka_ctx), argT...}, 2)
+    cached === nothing || return cached
+    interp, body, tt = kaaccesssignature(obj, iter, argT)
+    t = accessof(interp, body, tt; cache = accesscache(dev))
+    return view(t, 3:length(t))
+end
+
+"""
+What an eagerly launched KernelInterface kernel does to each of `args`. A view either
+way: the launch's closure captures it, and a union-typed capture is boxed.
+"""
+function kitouches(dev::LavaDevice, kern::K, args::Tuple, ndrange) where {K}
+    cached = cachedtouches(dev, Tuple{K, map(a -> devicetype(dev, a), args)...}, 1)
+    cached === nothing || return cached
+    t = argument_usage(dev, kern, args, ndrange, nothing)
+    return view(t, 1:length(t))
+end
+
 isdevicearray(::LavaArray) = true
-
-"""
-The union of what a trace's shaders do to `args`; every shader takes them
-(`rt_stages`).
-"""
-function kerneltouches(dev::LavaDevice, pipe::RayTracingPipeline, args::Tuple, ndrange, group)
-    argT = map(a -> devicetype(dev, a), args)
-    merged = fill(NOTOUCH, length(args))
-    for sh in shaders(pipe)
-        ts = accessof(Lava.kernelinterpreter(sh, Tuple{argT...}), sh, argT;
-                      cache = accesscache(dev))
-        for i in eachindex(merged)
-            merged[i] = merged[i] | ts[i + 1]
-        end
-    end
-    return merged
-end
-
-"""What each shader does to what it closed over, in `shaders` order."""
-function shadertouches(dev::LavaDevice, pipe::RayTracingPipeline, args::Tuple)
-    argT = map(a -> devicetype(dev, a), args)
-    return [accessof(Lava.kernelinterpreter(sh, Tuple{argT...}), sh, argT; cache = accesscache(dev))[1]
-            for sh in shaders(pipe)]
-end
+resource_identity(a::LavaArray)=a.buf.rc
 
 # Draw stages are compiled as wrappers (`resolve_shader_pair`) that add the
 # varyings and outputs, so accesses are inferred on the wrapper; the user

@@ -21,6 +21,8 @@ not count a tuple as a nesting level, or its pointers go unpatched on `resize!`)
 treat tuples the same way.
 """
 resolve(dev::Device, x::Tuple) = argmap(a -> resolve(dev, a), x)
+resolve(dev::Device, x::NamedTuple{Names}) where {Names} =
+    NamedTuple{Names}(argmap(a -> resolve(dev, a), values(x)))
 
 """
     Launch(kernel, args, ndrange, group, device)
@@ -39,13 +41,14 @@ struct Launch{K,A<:Tuple,N,G,D}
 end
 
 """
-    DeferredRange(store)
+    DeferredRange(store, at)
 
-A device-written dispatch count read at launch, not at compile, because an
-earlier pass writes it.
+A device-written dispatch count, element `at` of `store`, read at launch, not at
+compile, because an earlier pass writes it.
 """
 struct DeferredRange{S}
     store::S
+    at::Int
 end
 
 ndrangeof(::Device, n) = n
@@ -60,7 +63,7 @@ Hikari's wavefront queues on Apple M5).
 """
 function ndrangeof(dev::Device, r::DeferredRange)
     awaitwrites(dev)
-    return Int(first(r.store))
+    return Int(Array(r.store)[r.at])
 end
 
 """
@@ -69,7 +72,7 @@ end
 Wait for submitted device work before the host reads memory it wrote.
 Defaults to `KernelAbstractions.synchronize`.
 """
-awaitwrites(dev::Device) = KernelAbstractions.synchronize(backend(dev))
+awaitwrites(dev::Device) = KernelAbstractions.synchronize(dev)
 
 """
 Eager `kernel(args...; ndrange = DeviceRange(count; max))` on a KA backend
@@ -79,7 +82,7 @@ the surplus; without it the count is copied to the host.
 """
 function KernelAbstractions.launch_config(kernel::KernelAbstractions.Kernel, r::DeviceRange,
                                           workgroupsize)
-    n = r.max === nothing ? Int(first(Array(storage(r.count)))) : r.max
+    n = r.max === nothing ? Int(Array(storage(r.count))[r.at]) : r.max
     return KernelAbstractions.launch_config(kernel, (n,), workgroupsize)
 end
 
@@ -111,41 +114,31 @@ function buildskernel(f, backend)
 end
 
 """
-    kibackend(dev) -> backend
-
-The backend object that compiles `KernelInterface` kernels for `dev`:
-`backend(dev)` unless the device uses a separate KI type (ROCm). Without KI
-support [`kikernel`](@ref) refuses macro-free kernels.
-"""
-kibackend(dev) = backend(dev)
-
-"""
     kisupported(dev, f) -> Bool
 
 Whether `dev` can compile the macro-free kernel `f`.
 """
 function kisupported(dev, f)
-    be = kibackend(dev)
-    applicable(KI.argconvert, be, f) || return false
-    converted = KI.argconvert(be, f)
-    return hasmethod(KI.kernel_function, Tuple{typeof(be), typeof(converted), Type})
+    applicable(KI.argconvert, dev, f) || return false
+    converted = KI.argconvert(dev, f)
+    return hasmethod(KI.kernel_function, Tuple{typeof(dev), typeof(converted), Type})
 end
 
 """
     kikernel(f, dev, args) -> KI.Kernel
 
 The compiled kernel for a macro-free `f`, specialised on the `KI.argconvert`ed
-argument types, which is what the backend passes at launch.
+argument types, which is what the backend passes at launch. Without KI support
+the device refuses macro-free kernels.
 """
 function kikernel(f, dev, args)
-    be = kibackend(dev)
     kisupported(dev, f) || error(
         "Mantle: `dispatch!` was given `$f`, which is a macro-free kernel, and " *
-        "$(typeof(be)) implements no `KI.kernel_function`. The backend answers " *
+        "$(typeof(dev)) implements no `KI.kernel_function`. The backend answers " *
         "`KernelAbstractions` and not `KernelInterface`, so it can run an " *
         "`@kernel` but cannot compile a plain function.")
-    tt = Base.to_tuple_type(map(a -> Core.Typeof(KI.argconvert(be, a)), args))
-    return KI.kernel_function(be, KI.argconvert(be, f), tt)
+    tt = Base.to_tuple_type(map(a -> Core.Typeof(KI.argconvert(dev, a)), args))
+    return KI.kernel_function(dev, KI.argconvert(dev, f), tt)
 end
 
 """
@@ -174,7 +167,7 @@ Build the dispatch's KA kernel and refuse a kernel that captures variables: a
 plan resolves arguments once, so a captured array would go stale.
 """
 function kernelfor(d::Dispatch, dev::Device)
-    obj = kernelfor(d.kernel, d.group, backend(dev))
+    obj = kernelfor(d.kernel, d.group, dev)
     isempty(fieldnames(typeof(obj.f))) ||
         throw(ArgumentError("dispatch!: the kernel closes over $(fieldnames(typeof(obj.f))). " *
                             "A plan resolves its arguments once, so a captured device array " *
@@ -208,9 +201,58 @@ a `(3, n)` range from idling most lanes.
 defaultgroup(ndrange::Tuple, maxthreads::Integer; threads::Integer = 64) =
     KI.threads_to_workgroupsize(min(threads, maxthreads), ndrange)
 
-# `bake` turned a `DeviceRange` into its ceiling or a `DeferredRange`, so no
-# indirect command is needed (`PassPlan.indirect`).
-devicesized(::Launch) = false
+"""
+    LaunchShape
+
+How a KernelAbstractions kernel launches over an ndrange, worked out once instead
+of per launch: the canonical `ndrange`, its partition `iterspace` and the iteration
+context `ctx` the kernel takes first. The blocks and invocations per block come
+from `iterspace` ([`groupcount`](@ref), [`groupthreads`](@ref)).
+"""
+struct LaunchShape{N,I,C}
+    ndrange::N
+    iterspace::I
+    ctx::C
+end
+
+"""
+    launchshape(kernel, ndrange, group) -> LaunchShape
+
+The launch of a KA `kernel` (from [`kernelfor`](@ref)) over `ndrange` with the
+call's `group` ([`callgroup`](@ref)), as the backend's `KA.launch_config`
+partitions it.
+"""
+function launchshape(obj::KernelAbstractions.Kernel, ndrange, group)
+    nd, _, iterspace, _ = KernelAbstractions.launch_config(obj, ndrange, group)
+    return LaunchShape(nd, iterspace, KernelAbstractions.mkcontext(obj, nd, iterspace))
+end
+
+"""
+    tunedlaunch(compile, groupfor, kernel, ndrange, group) -> (compiled, shape)
+
+For a backend that picks a workgroup from the compiled kernel (its pipeline limit,
+its occupancy): compile the KA `kernel` for its launch over `ndrange`
+(`compile(ctx)`), and when the launch leaves the size to the backend (a
+`DynamicSize` kernel called without a `group`), repartition it into
+`groupfor(compiled, ndrange)`. That can change the context type, and then the
+kernel is compiled again: a kernel compiled for another context type reads its
+ndrange from the wrong fields.
+"""
+function tunedlaunch(compile, groupfor, obj::KernelAbstractions.Kernel, ndrange, group)
+    s = launchshape(obj, ndrange, group)
+    kernel = compile(s.ctx)
+    KernelAbstractions.workgroupsize(obj) <: KernelAbstractions.DynamicSize && group === nothing ||
+        return kernel, s
+    iterspace, _ = KernelAbstractions.partition(obj, s.ndrange, groupfor(kernel, s.ndrange))
+    tuned = LaunchShape(s.ndrange, iterspace, KernelAbstractions.mkcontext(obj, s.ndrange, iterspace))
+    typeof(tuned.ctx) === typeof(s.ctx) || (kernel = compile(tuned.ctx))
+    return kernel, tuned
+end
+
+"""The number of workgroups a shape launches."""
+groupcount(s::LaunchShape) = length(KernelAbstractions.blocks(s.iterspace))
+"""The invocations in each of a shape's workgroups."""
+groupthreads(s::LaunchShape) = length(KernelAbstractions.workitems(s.iterspace))
 
 """
     Call(f, args, device)
@@ -229,11 +271,9 @@ end
 (c::Call)() = (c.f(resolve(c.dev, c.args)...); nothing)
 argsize(::Call) = 0
 indirectindex(::Call) = 0
-devicesized(::Call) = false
 
 function bake(c::Compile, d::Dispatch)
     dev = c.graph.dev
-    be = backend(dev)
     args = argmap(a -> resolve(dev, a), d.args)
     # Refused here for every backend, per `runscalls`.
     if iscall(d)
@@ -247,9 +287,9 @@ function bake(c::Compile, d::Dispatch)
     end
     # A `KI.Kernel` takes the same `ndrange`/`workgroupsize` keywords as a
     # `KA.Kernel`, so `Launch` serves both.
-    buildskernel(d.kernel, be) || return Launch(kikernel(d.kernel, dev, args), args,
-                                                bakedrange(c, d.ndrange), d.group, dev)
-    let k = kernelfor(d.kernel, d.group, be)
+    buildskernel(d.kernel, dev) || return Launch(kikernel(d.kernel, dev, args), args,
+                                                 bakedrange(c, d.ndrange), d.group, dev)
+    let k = kernelfor(d.kernel, d.group, dev)
         Launch(k, args, bakedrange(c, d.ndrange), callgroup(k, d.group), dev)
     end
 end
@@ -261,7 +301,7 @@ bakedrange(::Compile, n) = n
 # syncs the device before every dispatch (320 per frame took 97% of a Hikari
 # frame on M5), so it is used only without `max`.
 bakedrange(c::Compile, r::DeviceRange) =
-    r.max === nothing ? DeferredRange(resolve(c.graph.dev, r.count)) : r.max
+    r.max === nothing ? DeferredRange(resolve(c.graph.dev, r.count), r.at) : r.max
 
 """
 The `Pipelines` phase for every backend: assign each draw and dispatch its
@@ -274,6 +314,7 @@ function run!(::Pipelines, c::Compile)
     indcursor = 0
     for p in ordered(c)
         checkrenderarea(p)
+        checkcopy(p)
         cds = CompiledDraw[]
         for d in p.draws
             cd = compiledraw(c, p, d, argcursor)
@@ -282,21 +323,53 @@ function run!(::Pipelines, c::Compile)
             push!(cds, cd)
             argcursor += argalign(argsize(cd))
         end
-        # Dispatches and traces compile to different types; `identity.` narrows
-        # a single-kind pass to a concrete vector so the frame loop specialises.
+        # Kept as `Any`: a vector of the dispatches' own type made the emit path
+        # (`emitpass!` and all under it) compile again for every pass with a new
+        # kernel, about a second per material type added to a scene, for a plan
+        # that records once. Each dispatch's own `emitdispatch!` specialises.
         compiled = Any[]
         for d in p.dispatches
             ind = d.ndrange isa DeviceRange ? (indcursor += 1) : 0
-            # Kernels `@eval`ed while declaring the graph (e.g. the
-            # `gemv_ncontig_kernel` family) are newer than the caller's world.
-            cd = Base.invokelatest(compile_dispatch, c, d, argcursor, ind)
+            # `invokelatest` because the kernel can be newer than the caller's
+            # world. A generated family (`gemv_ncontig_kernel` and its kin)
+            # `@eval`s its function while the graph is being declared, and a
+            # plan built in the same top-level call compiles it here. Called
+            # directly, the backend looked the method up in the caller's world
+            # and threw "method too new" on Metal and on Vulkan alike. Vulkan got
+            # past it only while its frozen kernel cache, keyed on types, answered
+            # before anything looked the method up; that cache is gone.
+            cd = try
+                Base.invokelatest(compile_dispatch, c, d, argcursor, ind)
+            catch
+                @error "Failed to compile Mantle pass" pass=p.name kernel=(d isa Dispatch ? d.kernel : typeof(d))
+                rethrow()
+            end
             push!(compiled, cd)
             argcursor += argalign(argsize(cd))
         end
         imgs, pre, barrier = passbarriers(c, p)
-        push!(c.passes, PassPlan(p, cds, identity.(compiled), imgs, pre, barrier))
+        push!(c.passes, PassPlan(p, cds, compiled, imgs, pre, barrier))
     end
     return c
+end
+
+"""
+    checkcopy(pass)
+
+Throw unless a `copy!` pass's destination holds every byte it copies, before any
+backend records the copy. Checked at every compile, since a tracking source's
+extent changes with a refit.
+"""
+function checkcopy(p::Pass)
+    p.kind === :copy || return nothing
+    src = first_target(p)
+    w, h = p.viewport === nothing ? target_extent(src) : (p.viewport[3], p.viewport[4])
+    need = w * h * pixelbytes(eltype(src))
+    have = length(p.dst) * sizeof(eltype(p.dst))
+    have >= need || throw(ArgumentError(
+        "copy! \"$(p.name)\": the destination holds $have bytes and the $(w)x$(h) pixels " *
+        "it copies need $need"))
+    return nothing
 end
 
 """
@@ -320,14 +393,11 @@ end
 """Bytes a compiled draw or dispatch packs into the plan's argument memory; zero
 for a `Launch`, which binds its arguments directly."""
 argsize(d::CompiledDraw) = d.argsize
-argsize(d::CompiledDispatch) = d.argsize
-argsize(d::CompiledTrace) = d.argsize
 argsize(::Launch) = 0
 
 """The indirect-command slot a compiled dispatch owns; zero when host-sized and
-for a `Launch`."""
-indirectindex(d::CompiledDispatch) = d.indirect
-indirectindex(d::CompiledTrace) = d.indirect
+for a `Launch`, whose `bake` turned a `DeviceRange` into its ceiling or a
+`DeferredRange`."""
 indirectindex(::Launch) = 0
 
 # A `DeviceRange` dispatch reads an indirect command that a core prepare kernel
@@ -349,21 +419,21 @@ function emitprepares!(e, pl::Plan, pp::PassPlan)
     am = pl.args
     inds = Any[]
     counts = Any[]
+    ats = Int32[]
     wss = UInt32[]
     for d in pp.dispatches
         k = indirectindex(d)
         k == 0 && continue
         push!(inds, indirectof(am, k))
         push!(counts, storage(d.ndrange.count))
+        push!(ats, Int32(d.ndrange.at))
         push!(wss, workgroupsize(d))
     end
     n = length(inds)
     n == 0 && return nothing
-    pred = pp.pass.predicate
-    gate = pred === nothing ? nothing : (storage(pred[1]), Int32(pred[2]))
     emitkernel!(e, multi_prepare_indirect_kernel,
-                ntuple(i -> inds[i], n), ntuple(i -> counts[i], n),
-                ntuple(i -> wss[i], n), gate;
+                ntuple(i -> inds[i], n), ntuple(i -> counts[i], n), ntuple(i -> ats[i], n),
+                ntuple(i -> wss[i], n), gateof(pp.pass.predicate);
                 ndrange = 1, workgroup_size = (1, 1, 1))
     emitpreparebarrier!(e)
     return nothing
@@ -371,13 +441,13 @@ end
 
 # One thread writes all the pass's indirect commands, unrolled over the tuples
 # (one kernel per arity).
-@inline multiprepare!(::Tuple{}, ::Tuple{}, ::Tuple{}, go) = nothing
-@inline function multiprepare!(inds::Tuple, sizes::Tuple, wss::Tuple, go)
-    n = UInt32(@inbounds sizes[1][1])
+@inline multiprepare!(::Tuple{}, ::Tuple{}, ::Tuple{}, ::Tuple{}, go) = nothing
+@inline function multiprepare!(inds::Tuple, sizes::Tuple, ats::Tuple, wss::Tuple, go)
+    n = UInt32(@inbounds sizes[1][ats[1]])
     ws = wss[1]
     groups = go ? (n + ws - UInt32(1)) ÷ ws : UInt32(0)
     writegroups!(inds[1], groups)   # groupCountX, or the ray count of a trace
-    multiprepare!(Base.tail(inds), Base.tail(sizes), Base.tail(wss), go)
+    multiprepare!(Base.tail(inds), Base.tail(sizes), Base.tail(ats), Base.tail(wss), go)
     return nothing
 end
 
@@ -397,17 +467,24 @@ command; Metal's ICB slots override it to rewrite the recorded command.
     return nothing
 end
 
+"""
+    gateof(predicate) -> gate or nothing
+
+A pass's `repeat!` predicate, `(buffer, index)`, as kernels and the host read it:
+the buffer's storage and the zero-based index. [`gateopen`](@ref) decides it.
+"""
+gateof(::Nothing) = nothing
+gateof((pred, i)::Tuple{Any,Int}) = (storage(pred), Int32(i))
+
 """Whether the pass's `repeat!` iteration runs: no gate, or a nonzero flag."""
 @inline gateopen(::Nothing) = true
 @inline gateopen(gate::Tuple) = (@inbounds gate[1][gate[2] + Int32(1)].go) != UInt32(0)
 
-function multi_prepare_indirect_kernel(inds, sizes, wss, gate)
-    multiprepare!(inds, sizes, wss, gateopen(gate))
+function multi_prepare_indirect_kernel(inds, sizes, ats, wss, gate)
+    multiprepare!(inds, sizes, ats, wss, gateopen(gate))
     return nothing
 end
 
-# A trace's indirect command counts rays, not workgroups.
-workgroupsize(::CompiledTrace) = UInt32(1)
 
 """
     drawviewport(pass, draw) -> viewport or nothing
@@ -437,32 +514,45 @@ non-empty list (or either, when both stages share one).
 @inline packedargs(b::DrawBinding, _, _) = b
 @inline packedargs(::Tuple, vargs, fargs) = isempty(fargs) ? vargs : fargs
 
-# Formats come from the pass's own targets: a pipeline is compiled for the
-# attachments it draws into.
+"""
+    compiledraw(c, pass, draw, argoff) -> CompiledDraw
+
+Compile a draw for every backend: the pipeline for the pass's own attachments, in
+their native formats so an sRGB target gets an sRGB pipeline, and the draw's
+arguments resolved, its count baked and its viewport fixed against the pass. The
+argument block at `argoff` is as large as the backend packs it (`packedsize`).
+"""
 function compiledraw(c::Compile, p::Pass, d, argoff::Int)
     dev = c.graph.dev
-    color_formats = [attachment_format(t) for t in p.targets]
-    depth_format  = p.depth === nothing ? nothing : attachment_format(p.depth)
+    color_formats = [target_format(t) for t in p.targets]
+    depth_format  = p.depth === nothing ? nothing : target_format(p.depth)
     # A cell's current contents; `rebind!` cannot change their types.
     vargs = argmap(a -> resolve(dev, a), drawargs(d.args))
     fargs = argmap(a -> resolve(dev, a), d.frag_args)
     checkdepthtarget(d.shader.depth, depth_format !== nothing)
+    checkstages(dev, d.shader)
     compiled = compile_draw(dev, d.shader, color_formats, depth_format, vargs, fargs;
                             bindings = d.bindings)
     indices = d.indices === nothing ? nothing : resolve(dev, d.indices)
     # One list, not both: stages may share the same list.
     stageargs = packedargs(d.args, vargs, fargs)
     return CompiledDraw(compiled, d.shader, stageargs, bakedcount(c, d.count),
-                        drawviewport(p, d), d.bindings, indices, d.instances, argoff, 0)
+                        drawviewport(p, d), d.bindings, indices, d.instances, argoff,
+                        packedsize(compiled))
 end
+
+"""
+    packedsize(compiled) -> Int
+
+The bytes of plan argument memory a compiled draw's arguments are packed into once
+per recording; 0 where a backend binds them per draw instead.
+"""
+packedsize(compiled) = 0
 compile_dispatch(c::Compile, d::Dispatch, ::Int, ::Int) = bake(c, d)
 
 """A draw's count with an indirect `Commands` buffer resolved to its storage."""
 bakedcount(::Compile, n) = n
 bakedcount(c::Compile, n::Commands) = Commands(resolve(c.graph.dev, n.resource))
-
-"""An attachment's element type, which is the format a pipeline compiles for."""
-attachment_format(t) = eltype(t)
 
 # Where a host store lands in a walked run: an in-place write on the calling
 # thread at the update pass. Whether in-flight work still reads the memory is
@@ -487,8 +577,9 @@ run's own submission. A failure after the acquire hands the image back
 function run!(pl::Plan)
     checklive(pl, pl.slabs, length(pl.graph.transients))
     reclaim!(pool(pl.graph.dev), pl.graph.dev)
-    beforeframe!(pl.graph.dev, pl)
     try
+        preparereadbacks!(pl)
+        beforeframe!(pl.graph.dev, pl)
         # After the acquire, which is the last place a resize is noticed.
         # Refitting earlier can pair a new-size colour target with an old-size
         # depth target, a lost device on NVIDIA.
@@ -498,8 +589,10 @@ function run!(pl::Plan)
         # Re-record on the owning thread what a move or refit invalidated.
         pl.stale && (pl.stale = false; record!(pl))
         execute!(pl.graph.dev, pl)
-    catch
+    catch err
+        failreadbacks!(pl, err)
         abandonframe!(pl.graph.dev, pl)
+        foreach(s -> presented!(s.win), pl.graph.surfaces)
         rethrow()
     end
     return nothing
@@ -558,8 +651,11 @@ function execute!(dev, pl::Plan)
         end
         closerun!(dev, pl, front)
     end
+    # `closerun!` presented the frame's images.
+    foreach(s -> presented!(s.win), pl.graph.surfaces)
     am = pl.args
     am === nothing || setargtoken!(am, tok)
+    commitreadbacks!(pl, tok)
     pl.stamped && (pl.profiler.pending = true)
     return nothing
 end
@@ -655,43 +751,56 @@ end
 # recordings walk it every `execute!` with the `Immediate` emitter.
 
 """
-    emitplan!(emitter, plan)
+    emitplan!(emitter, plan; stores = true)
 
 Walk the plan into `emitter`: the head, then every pass in compile order.
+`stores = false` for a recording, which holds no host store: it would replay this
+run's values forever, so each run lands them in front of it ([`emitupdates!`](@ref)).
 """
-function emitplan!(e, pl::Plan)
+function emitplan!(e, pl::Plan; stores::Bool = true)
     emithead!(e, pl)
-    # Loop bodies are walked once per iteration here; recordings instead cut a
-    # loop into pieces (`partitionranges`) and repeat them at submission.
-    i = 1
-    for (r, loop) in pl.loops
-        emitpasses!(e, pl, i:(first(r) - 1))
+    # A loop body is walked once per iteration, behind its loop head. Only a
+    # WALKED plan gets here with a loop (an interpreted run, a windowed frame):
+    # a recording cuts a loop into pieces of its own (`partitionranges`) and
+    # repeats them at submission.
+    emitloopregion!(e, pl, 1:length(pl.passes), nothing; stores)
+    return nothing
+end
+
+# Walk only the immediate children here. Their bodies recursively walk their
+# own children, so an inner loop's index reset runs once per outer iteration.
+function emitloopregion!(e, pl::Plan, range, parent; stores::Bool = true)
+    cursor = first(range)
+    for (body, loop) in pl.loops
+        loop.parent === parent || continue
+        first(body) in range || continue
+        emitpasses!(e, pl, cursor:(first(body) - 1); stores)
         for _ in 1:loop.count
-            emitloophead!(e, pl, r)
-            emitpasses!(e, pl, r)
+            emitloophead!(e, pl, body)
+            emitloopregion!(e, pl, body, loop; stores)
         end
-        i = last(r) + 1
+        cursor = last(body) + 1
     end
-    emitpasses!(e, pl, i:length(pl.passes))
+    emitpasses!(e, pl, cursor:last(range); stores)
     return nothing
 end
 
 """
-    emitpasses!(emitter, plan, range)
+    emitpasses!(emitter, plan, range; stores = true)
 
 Emit the passes in `range`, with profiler timestamps around each when stamped.
 [`recordparts!`](@ref) uses it to emit one slice per recorded piece.
 """
-function emitpasses!(e, pl::Plan, range)
+function emitpasses!(e, pl::Plan, range; stores::Bool = true)
     # Two loops so an unprofiled run pays no per-pass branch.
     if !pl.stamped
         for i in range
-            emitpass!(e, pl, pl.passes[i])
+            emitpass!(e, pl, pl.passes[i]; stores)
         end
     else
         for i in range
             profiled!(pl, e, i) do
-                emitpass!(e, pl, pl.passes[i])
+                emitpass!(e, pl, pl.passes[i]; stores)
             end
         end
     end
@@ -699,15 +808,15 @@ function emitpasses!(e, pl::Plan, range)
 end
 
 """
-    emitpass!(emitter, plan, passplan)
+    emitpass!(emitter, plan, passplan; stores = true)
 
 One pass: barriers, the fused prepare, then its work inside its predicate scope.
 An update pass goes whole to `emitupdate!`, since the emitter decides where its
-stores land.
+stores land, and emits nothing without `stores` ([`emitplan!`](@ref)).
 """
-function emitpass!(e, pl, pp::PassPlan)
+function emitpass!(e, pl, pp::PassPlan; stores::Bool = true)
     p = pp.pass
-    p.kind === :update && return emitupdate!(e, pl, pp)
+    p.kind === :update && return stores ? emitupdate!(e, pl, pp) : nothing
     emitbarriers!(e, pp)
     # Before the predicate scope, so a discarded iteration still writes zero
     # groups or rays. Vulkan conditional rendering does not cover trace-rays, so
@@ -730,6 +839,8 @@ function emitwork!(e, pl::Plan, pp::PassPlan)
         end
     elseif p.kind === :copy
         emitcopy!(e, pl, pp)
+    elseif p.kind === :readback
+        emitreadback!(e, pl, pp)
     else
         h = beginrender!(e, pl, pp)
         try
@@ -785,7 +896,7 @@ function recordplan!(dev, pl::Plan)
     empty!(pl.patchtab)
     empty!(pl.pending_patches)
     if length(ranges) == 1
-        emitplan!(e, pl)
+        emitplan!(e, pl; stores = false)
         pl.recording = closerecording!(e, pl)
     else
         pl.recording = recordparts!(dev, pl, e, ranges)
@@ -813,7 +924,7 @@ function recordparts!(dev, pl::Plan, emitter, ranges)
             # A loop body's first piece starts each iteration with a full barrier.
             isempty(chunk) || first(chunk) in heads &&
                 emitloophead!(e, pl, only(r for (r, _) in pl.loops if first(r) == first(chunk)))
-            emitpasses!(e, pl, chunk)
+            emitpasses!(e, pl, chunk; stores = false)
             push!(parts, closerecording!(e, pl))
             e = nothing
         end
@@ -833,49 +944,69 @@ end
 
 The pieces in submission order (a loop body's repeated per iteration), grouped
 into submissions while their measured cost fits the budget. An unmeasured piece
-is submitted alone. At a finite budget each iteration
-of a gated loop starts a new submission, because its timestamps describe only
-the last, possibly discarded, iteration.
+is submitted alone. At a finite budget each iteration of a gated loop starts a
+new submission, because its timestamps describe only the last, possibly
+discarded, iteration. Nested loops expand their pieces recursively.
 """
 function submissionbatches(pl::Plan, ranges, parts::Vector{R}) where {R}
     loopof(r) = isempty(r) ? nothing : pl.passes[first(r)].pass.loop
     order = Int[]
-    gatedheads = Set{Int}()
-    k = 1
-    while k <= length(ranges)
-        l = loopof(ranges[k])
-        if l === nothing
-            push!(order, k)
-            k += 1
-        else
-            j = k
-            while j < length(ranges) && loopof(ranges[j + 1]) === l
-                j += 1
-            end
-            if isfinite(pl.budget) && any(i -> pl.passes[i].pass.predicate !== nothing,
-                                         first(ranges[k]):last(ranges[j]))
-                push!(gatedheads, k)
-            end
-            for _ in 1:l.count
-                append!(order, k:j)
-            end
-            k = j + 1
-        end
-    end
+    looporder!(order, ranges, pl, 1:length(ranges), nothing)
     timed = measurable(pl)
     cost(k) = timed ? sum(i -> isnan(pl.passcost[i]) ? Inf : pl.passcost[i], ranges[k]; init = 0.0) : 0.0
     batches = Vector{R}[]
+    gatedloops = IdDict{Any, Bool}()
+    for pp in pl.passes
+        pp.pass.predicate === nothing && continue
+        loop = pp.pass.loop
+        while loop !== nothing
+            gatedloops[loop] = true
+            loop = loop.parent
+        end
+    end
+    previous = 0
     t = Inf
     for k in order
         c = cost(k)
-        if k in gatedheads || isempty(batches) || t + c > pl.budget
+        iteration_boundary = isfinite(pl.budget) && k <= previous &&
+            any(loop -> withinloop(loopof(ranges[k]), loop), keys(gatedloops))
+        if iteration_boundary || isempty(batches) || t + c > pl.budget
             push!(batches, R[])
             t = 0.0
         end
         push!(batches[end], parts[k])
         t += c
+        previous = k
     end
     return batches
+end
+
+# A recording is still a flat list of pieces. Expand the loop tree into piece
+# order once at recording time; runs submit those retained pieces unchanged.
+function looporder!(order, ranges, pl::Plan, span, parent)
+    k = first(span)
+    while k <= last(span)
+        range = ranges[k]
+        loop = isempty(range) ? nothing : pl.passes[first(range)].pass.loop
+        if loop === parent
+            push!(order, k)
+            k += 1
+            continue
+        end
+        child = childloop(loop, parent)
+        j = k
+        while j < last(span)
+            next = ranges[j + 1]
+            isempty(next) && break
+            withinloop(pl.passes[first(next)].pass.loop, child) || break
+            j += 1
+        end
+        for _ in 1:child.count
+            looporder!(order, ranges, pl, k:j, child)
+        end
+        k = j + 1
+    end
+    return order
 end
 
 """
@@ -946,8 +1077,8 @@ end
 """
 The recorded pieces of one plan (see [`partitionranges`](@ref)), so no
 submission exceeds the budget or the driver timeout. Barriers between pieces are
-the graph's, and pieces are submitted in order. Backends implement
-`submitrecording!` for one piece; core submits the sequence.
+the graph's, and pieces are submitted in order. Core submits the sequence, one
+batch of pieces at a time (`submitrecording!`).
 """
 struct RecordingParts{R}
     parts::Vector{R}
@@ -961,8 +1092,7 @@ release!(rec::RecordingParts) = (foreach(release!, rec.parts); nothing)
 """
     submitrecording!(ctx, recording, emitter) -> token
 
-Submit a recording; backends answer for their own piece type, this method
-submits a partition's batches in order. The run's emitter, carrying host stores
+Submit a partition's batches in order. The run's emitter, carrying host stores
 and patches, goes with the first submission.
 """
 function submitrecording!(ctx, rec::RecordingParts, e)
@@ -982,24 +1112,34 @@ calls are static; a dynamic call would box the returned `UInt64` token every run
 """
 function submitplan!(ctx, pl::Plan, e, ::Type{R}) where {R}
     rec = pl.recording
-    rec isa R && return submitrecording!(ctx, rec, e)
+    rec isa R && return submitrecording!(ctx, (rec,), e)
     rec === nothing && return submitrecording!(ctx, nothing, e)
     return submitrecording!(ctx, rec::RecordingParts{R}, e)
 end
 
 """
-    submitrecording!(ctx, pieces::AbstractVector, emitter) -> token
+    submitrecording!(ctx, pieces, emitter) -> token
 
-One submission of several pieces, in order. This default submits them one by one;
-backends that batch command buffers specialise it.
+One submission of recorded pieces (a `Tuple` or `Vector`, one piece for an
+unpartitioned plan), in order. This default submits them one by one
+([`submitpiece!`](@ref)); backends that batch command buffers specialise it for
+their piece type.
 """
-function submitrecording!(ctx, pieces::AbstractVector, e)
-    tok = submitrecording!(ctx, pieces[1], e)
+function submitrecording!(ctx, pieces::Union{Tuple,AbstractVector}, e)
+    tok = submitpiece!(ctx, pieces[1], e)
     for k in 2:length(pieces)
-        tok = submitrecording!(ctx, pieces[k], nothing)
+        tok = submitpiece!(ctx, pieces[k], nothing)
     end
     return tok
 end
+
+"""
+    submitpiece!(ctx, piece, emitter) -> token
+
+Submit one recorded piece, for a backend that does not batch them
+(`submitrecording!`).
+"""
+function submitpiece! end
 
 """
     recordable(plan) -> Bool
@@ -1011,12 +1151,40 @@ runs); such plans are walked every run and the packer re-reads every cell.
 recordable(pl::Plan) = isempty(pl.graph.surfaces) && !hasrebindable(pl)
 
 """
+    recordspass(device, pass) -> Bool
+
+Whether `device` records `pass` into a recording; a plan holding a pass it does
+not is walked every run. Every pass by default.
+"""
+recordspass(::Device, ::Pass) = true
+
+"""
+    recordsprofiled(device) -> Bool
+
+Whether `device` records a profiled plan, timing its passes inside the recording.
+Otherwise a profiled plan is walked every run, since a replay has no pass walk to
+bracket with timing events.
+"""
+recordsprofiled(::Device) = true
+
+"""Whether `device` records every one of `passes` ([`recordspass`](@ref))."""
+recordspasses(dev, passes) = all(p -> recordspass(dev, p), passes)
+
+"""
     recordable(device, plan) -> Bool
 
-Whether `device` records this plan: core's conditions plus the backend's own. A
+Whether `device` records this plan: core's conditions, every pass
+([`recordspass`](@ref)) and a profiled plan ([`recordsprofiled`](@ref)). A
 declined plan is walked by `run!` instead of refused.
 """
-recordable(::Device, pl::Plan) = recordable(pl)
+# Core inspects declared passes, not compiled output (which is still empty when
+# choosing entry synchronization). Devices report which native command kinds
+# their recording can contain; they do not select the plan's execution route.
+recordablekind(::Device, ::Val) = true
+recordablepasses(dev::Device, ps) = all(p -> recordablekind(dev, Val(p.kind)), ps)
+
+recordable(dev::Device, pl::Plan) =
+    recordable(pl) && recordspasses(dev, pl.graph.passes) && (recordsprofiled(dev) || !pl.profile)
 
 """Whether any draw takes its arguments from a `DrawBinding`."""
 hasrebindable(pl::Plan) = any(d -> d.args isa DrawBinding, (d for p in pl.graph.passes for d in p.draws))
@@ -1024,9 +1192,9 @@ hasrebindable(pl::Plan) = any(d -> d.args isa DrawBinding, (d for p in pl.graph.
 # The `Immediate` emitter: primitives do their work at once, through the verbs in
 # `graphics/commands.jl` and the baked dispatch callables.
 
-function withpredicate(f, ::Immediate, (pred, i)::Tuple{Any,Int})
+function withpredicate(f, ::Immediate, pred::Tuple{Any,Int})
     # The gate dispatch already ran on this thread; read its flag directly.
-    storage(pred)[i + 1].go == 0 && return nothing
+    gateopen(gateof(pred)) || return nothing
     return f()
 end
 
@@ -1056,17 +1224,28 @@ function beginrender!(::Immediate, pl::Plan, pp::PassPlan)
     depth = p.depth === nothing ? nothing : target_view(p.depth)
     return begin_render_pass!(pl.graph.dev, targets, p.loads, depth, p.depth_load)
 end
-function emitdraw!(::Immediate, handle, d)
+"""
+    emitdraw!(emitter, handle, draw)
+
+One compiled draw in the open render pass `handle`: its viewport (a draw's own
+overrides the pass's full-target one, so several axes share a pass), its bindings,
+then the draw itself ([`drawcompiled!`](@ref)). Read through the binding:
+textures, counts, instances and indices may all change per run without rebuilding
+the plan.
+"""
+function emitdraw!(e, handle, d::CompiledDraw)
     d.viewport === nothing || setviewport!(handle, d.viewport...)
-    # Read through the binding: textures, counts, instances and indices may all
-    # change per run without rebuilding the plan.
     bind = boundbindings(d.args, d.bindings)
     bind === nothing || use_bindings!(handle, d.compiled, bind)
+    drawcompiled!(e, handle, d)
+    return nothing
+end
+
+# Walked: the backend's `record_draw!` packs the arguments itself.
+drawcompiled!(::Immediate, handle, d::CompiledDraw) =
     record_draw!(handle, d.compiled, drawargs(d.args), drawcount(boundcount(d.args, d.count));
                  instances = boundinstances(d.args, d.instances),
                  indices = boundindices(d.args, d.indices))
-    return nothing
-end
 
 """
     drawcount(count)

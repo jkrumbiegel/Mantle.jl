@@ -247,10 +247,11 @@ _VULKAN_OK || @info "Mantle tests: no Vulkan driver and compiler pair; skipping 
 # free identifiers that ONLY the extension defines, so the list is what is
 # actually used and not a guess.
 if _VULKAN_OK
-    using Mantle: LavaArray, VulkanFramebuffer, VulkanWindow,
+    using Mantle: LavaArray, VulkanFramebuffer,
                 VulkanCompiledGraphicsPipeline, DebugConfig, copy_framebuffer!,
                 fastdiv
 end
+include(joinpath(@__DIR__, "test_inorder_host.jl"))
 
 # The barrier lowering per API marker: host tables, no device and no driver, so they
 # run on every machine. Every build compiles the Vulkan tree, the Mac's through the
@@ -454,14 +455,14 @@ import Vulkan
     # The Vulkan lowering of what a render pass declares. The behaviour each one
     # leads to (a kept target keeps its pixels, a depth test decides) is asserted
     # on every backend in `test_window.jl`; these are the tables underneath.
-    @testset "a traced usage adds the ray-tracing stage and nothing else" begin
+    # A ray query traces from an ordinary shader, so reading the structure is a
+    # shader-stage access. The ray-tracing stage needs the ray-tracing pipeline
+    # feature, which no device is asked for: naming it is a validation error.
+    @testset "reading an acceleration structure waits on the shader stages" begin
         RT = S2(Vulkan.PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR)
-        T = Traced{Storage{BufferKind,ReadWrite}}
-        S = Storage{BufferKind,ReadWrite}
         for d in (Src(), Dst())
-            @test (Mantle.stages(be, T, d) & RT) == RT
-            @test (Mantle.stages(be, S, d) & RT) == S2(0)
-            @test Mantle.access(be, T, d) == Mantle.access(be, S, d)
+            @test Mantle.stages(be, TraceRead, d) == Mantle.stages(be, Storage{BufferKind,ReadOnly}, d)
+            @test (Mantle.stages(be, TraceRead, d) & RT) == S2(0)
         end
     end
 
@@ -472,7 +473,7 @@ import Vulkan
     end
 
     @testset "a Float32 target is depth, by format and by aspect" begin
-        @test Mantle.vkformat(be, Float32) == Vulkan.FORMAT_D32_SFLOAT
+        @test Mantle.pixelformat(be, Float32) == Vulkan.FORMAT_D32_SFLOAT
         @test Mantle.aspect(Float32) == Vulkan.IMAGE_ASPECT_DEPTH_BIT
     end
 
@@ -536,43 +537,45 @@ include(joinpath(@__DIR__, "test_basealignment.jl"))
 # output object.
 include(joinpath(@__DIR__, "test_pipeline_stages.jl"))
 include(joinpath(@__DIR__, "test_raytracing_geometry.jl"))
-include(joinpath(@__DIR__, "test_tlas_mutation.jl"))
+include(joinpath(@__DIR__, "test_device_registry.jl"))
+include(joinpath(@__DIR__, "test_precompile_statements.jl"))
+include(joinpath(@__DIR__, "test_storebits.jl"))
 include(joinpath(@__DIR__, "test_collection_policy.jl"))
 include(joinpath(@__DIR__, "test_compilation_cache.jl"))
 include(joinpath(@__DIR__, "test_kernel_preparation.jl"))
-isdefined(Mantle, :VideoDecode) && include(joinpath(@__DIR__, "test_video_bitstream.jl"))
+include(joinpath(@__DIR__, "test_video_bitstream.jl"))
 if _VULKAN_OK
     include(joinpath(@__DIR__, "vulkan", "test_collection_policy.jl"))
-    check_pressure_collection(Mantle.vk_context())
+    check_pressure_collection(Mantle.Device(Mantle.VulkanAPI()))
     include(joinpath(@__DIR__, "vulkan", "test_cache_invalidation.jl"))
-    check_cache_invalidation(Mantle.vk_context())
+    check_cache_invalidation(Mantle.Device(Mantle.VulkanAPI()))
     include(joinpath(@__DIR__, "vulkan", "test_pipeline_publication.jl"))
-    check_pipeline_publication(Mantle.vk_context())
+    check_pipeline_publication(Mantle.Device(Mantle.VulkanAPI()))
     include(joinpath(@__DIR__, "vulkan", "test_draw_argument_lifetime.jl"))
-    check_draw_argument_lifetime(Mantle.vk_context())
+    check_draw_argument_lifetime(Mantle.Device(Mantle.VulkanAPI()))
     include(joinpath(@__DIR__, "vulkan", "test_host_upload.jl"))
-    check_host_upload(Mantle.vk_context())
-    check_bounded_staging(Mantle.vk_context())
-    check_extent_refusal(Mantle.vk_context())
-    check_copy_bounds(Mantle.vk_context())
-    check_append_view(Mantle.vk_context())
+    check_host_upload(Mantle.Device(Mantle.VulkanAPI()))
+    check_bounded_staging(Mantle.Device(Mantle.VulkanAPI()))
+    check_extent_refusal(Mantle.Device(Mantle.VulkanAPI()))
+    check_copy_bounds(Mantle.Device(Mantle.VulkanAPI()))
+    check_append_view(Mantle.Device(Mantle.VulkanAPI()))
     include(joinpath(@__DIR__, "vulkan", "test_gemm_workspace.jl"))
-    check_workspace_retirement(Mantle.vk_context())
+    check_workspace_retirement(Mantle.Device(Mantle.VulkanAPI()))
     include(joinpath(@__DIR__, "vulkan", "test_flush_report.jl"))
-    check_flush_report(Mantle.vk_context())
+    check_flush_report(Mantle.Device(Mantle.VulkanAPI()))
     include(joinpath(@__DIR__, "vulkan", "test_live_buffers.jl"))
-    check_live_buffers(Mantle.vk_context())
+    check_live_buffers(Mantle.Device(Mantle.VulkanAPI()))
     include(joinpath(@__DIR__, "vulkan", "test_pipeline_creation.jl"))
-    check_pipeline_creation(Mantle.vk_context())
+    check_pipeline_creation(Mantle.Device(Mantle.VulkanAPI()))
     include(joinpath(@__DIR__, "vulkan", "test_recording_trim.jl"))
     check_recording_trim(Mantle.defaultbackend())
-    check_store_submission(Mantle.vk_context())
-    include(joinpath(@__DIR__, "vulkan", "test_accel_barriers.jl"))
-    check_accel_barriers(Mantle.vk_context())
-    include(joinpath(@__DIR__, "vulkan", "test_tlas_mutation.jl"))
-    check_tlas_mutation_allocations(Mantle.vk_context())
+    check_store_submission(Mantle.Device(Mantle.VulkanAPI()))
+    include(joinpath(@__DIR__, "vulkan", "test_external_image.jl"))
+    check_external_image(Mantle.Device(Mantle.VulkanAPI()))
+    include(joinpath(@__DIR__, "vulkan", "test_channel_waits.jl"))
+    check_channel_waits(Mantle.Device(Mantle.VulkanAPI()))
     include(joinpath(@__DIR__, "vulkan", "test_video_sessions.jl"))
-    check_video_sessions(Mantle.vk_context())
+    check_video_sessions(Mantle.Device(Mantle.VulkanAPI()))
 end
 # Also needs no GPU, and that is the point of the design rather than a happy
 # accident: everything the geometry-to-mesh lowering does except read one builtin
@@ -580,6 +583,7 @@ end
 # `KernelInterface.HostMeshOutput` runs what a mesh stage runs and shows the
 # vertices, indices and per-primitive values a frame can only imply.
 include(joinpath(@__DIR__, "test_lowering.jl"))
+# Whether a ray query through an accel is a call already; no device needed.
 
 # The isubd example's pass A (adaptive refinement) against a CPU reference written
 # independently of it (`examples/isubd/reference.jl`, vendored from
@@ -635,6 +639,8 @@ include(joinpath(@__DIR__, "test_no_ambient_allocation.jl"))
 
 include(joinpath(@__DIR__, "test_submit_channel.jl"))
 include(joinpath(@__DIR__, "test_catch_returns_no_sentinel.jl"))
+_VULKAN_OK && include(joinpath(@__DIR__, "vulkan", "test_inline_argument_extent.jl"))
+_VULKAN_OK && include(joinpath(@__DIR__, "vulkan", "test_buffer_barrier_policy.jl"))
 include(joinpath(@__DIR__, "foreachbackend.jl"))
 
 # NOT gated on `_VULKAN_OK` any more. Everything below runs once per backend
@@ -658,6 +664,7 @@ foreachbackend(joinpath(@__DIR__, "test_arena_recording.jl"))
 # need no device, and the walk needs the interpreter a backend compiles with.
 include(joinpath(@__DIR__, "test_access.jl"))
 foreachbackend(joinpath(@__DIR__, "test_compile_golden.jl"))
+foreachbackend(joinpath(@__DIR__, "test_recorded_buffer_sync.jl"))
 # Same shape: headless, GPU-only. A `DeviceRange` is the one ndrange whose value
 # never reaches the host, so the Host backend cannot pin the half that matters.
 foreachbackend(joinpath(@__DIR__, "test_devicerange.jl"))
@@ -699,6 +706,7 @@ foreachbackend(joinpath(@__DIR__, "test_dropped_resources.jl"))
 # many submissions a call makes, what `error()` in a kernel means, the pool's own
 # trim policy, and a refused allocation that is `nothing`.
 foreachbackend(joinpath(@__DIR__, "test_submission_count.jl"))
+foreachbackend(joinpath(@__DIR__, "test_readback.jl"))
 foreachbackend(joinpath(@__DIR__, "test_kernel_error.jl"))
 foreachbackend(joinpath(@__DIR__, "test_pool_trim_policy.jl"))
 foreachbackend(joinpath(@__DIR__, "test_tolerated_alloc_failure.jl"))
@@ -795,30 +803,37 @@ foreachbackend(joinpath(@__DIR__, "test_coopmat_reduce.jl"))
 foreachbackend(joinpath(@__DIR__, "test_coopmat_components.jl"))
 
 foreachbackend(joinpath(@__DIR__, "test_aabb_blas_overlap.jl"))
-_VULKAN_OK && foreachbackend(joinpath(@__DIR__, "vulkan", "test_aabb_blas_device.jl"))
+foreachbackend(joinpath(@__DIR__, "test_aabb_blas_device.jl"))
+foreachbackend(joinpath(@__DIR__, "test_blas_offset_inputs.jl"))
 foreachbackend(joinpath(@__DIR__, "test_atomics_and_dispatch.jl"))
 foreachbackend(joinpath(@__DIR__, "test_float_conversion_exact.jl"))
+foreachbackend(joinpath(@__DIR__, "test_bit_intrinsics.jl"))
+foreachbackend(joinpath(@__DIR__, "test_odd_integers.jl"))
+foreachbackend(joinpath(@__DIR__, "test_punned_store_into_array.jl"))
 foreachbackend(joinpath(@__DIR__, "test_integer_division.jl"))
 foreachbackend(joinpath(@__DIR__, "test_gpuarrays.jl"))
 foreachbackend(joinpath(@__DIR__, "test_int32_cartesian_miscompile.jl"))
 foreachbackend(joinpath(@__DIR__, "test_logical_pointer_bitcast.jl"))
 foreachbackend(joinpath(@__DIR__, "test_loop_unswitch_miscompile.jl"))
 foreachbackend(joinpath(@__DIR__, "test_psb_chain_fold.jl"))
+foreachbackend(joinpath(@__DIR__, "test_branch_between_views.jl"))
+foreachbackend(joinpath(@__DIR__, "test_smatrix_in_kernel.jl"))
 foreachbackend(joinpath(@__DIR__, "test_spirv_pattern_correctness.jl"))
 foreachbackend(joinpath(@__DIR__, "test_struct_broadcast.jl"))
 foreachbackend(joinpath(@__DIR__, "test_vector_pointer_access.jl"))
 foreachbackend(joinpath(@__DIR__, "test_element_rebuild_store.jl"))
+foreachbackend(joinpath(@__DIR__, "test_lane_reductions.jl"))
 foreachbackend(joinpath(@__DIR__, "test_native_integer_widths.jl"))
 foreachbackend(joinpath(@__DIR__, "test_constant_pointer_icmp.jl"))
 
 foreachbackend(joinpath(@__DIR__, "test_trace_closest_hit.jl"))
-foreachbackend(joinpath(@__DIR__, "test_rt_pipeline.jl"))
 foreachbackend(joinpath(@__DIR__, "test_math_intrinsics.jl"))
 foreachbackend(joinpath(@__DIR__, "test_workgroup_struct_accesschain.jl"))
 foreachbackend(joinpath(@__DIR__, "test_kernel_print.jl"))
 foreachbackend(joinpath(@__DIR__, "test_array_capability_queries.jl"))
 
 foreachbackend(joinpath(@__DIR__, "test_holdleaves_stops_at_tlas.jl"))
+foreachbackend(joinpath(@__DIR__, "test_tlas_mutation.jl"))
 foreachbackend(joinpath(@__DIR__, "test_hwtlas_batch_delete.jl"))
 foreachbackend(joinpath(@__DIR__, "test_hwtlas_batch_triangles.jl"))
 foreachbackend(joinpath(@__DIR__, "test_hwtlas_device.jl"))
@@ -837,6 +852,8 @@ foreachbackend(joinpath(@__DIR__, "test_hwtlas_refit_stress.jl"))
 # The software structure, `Raycore.TLAS`, returns the hit the hardware one does:
 # the same scene traced through both, before and after a kernel-written refit.
 foreachbackend(joinpath(@__DIR__, "test_tlas_same_hit.jl"))
+# ...and the same recorded hits through see-through instances (`transparent_hits`).
+foreachbackend(joinpath(@__DIR__, "test_transparent_hits.jl"))
 foreachbackend(joinpath(@__DIR__, "test_instance_writer_kernel.jl"))
 foreachbackend(joinpath(@__DIR__, "test_instance_masks.jl"))
 foreachbackend(joinpath(@__DIR__, "test_blas_refit.jl"))
@@ -864,6 +881,7 @@ foreachbackend(joinpath(@__DIR__, "test_dispatch_allocation.jl"))
 foreachbackend(joinpath(@__DIR__, "test_free_during_recording.jl"))
 foreachbackend(joinpath(@__DIR__, "test_gpu_memory_safety.jl"))
 foreachbackend(joinpath(@__DIR__, "test_kernel_cache.jl"))
+foreachbackend(joinpath(@__DIR__, "test_kernel_persistence.jl"))
 foreachbackend(joinpath(@__DIR__, "test_multitypeset_surgical.jl"))
 # Recording a plan big enough to allocate while it is being written.
 foreachbackend(joinpath(@__DIR__, "test_no_pool_trim_while_recorded.jl"))
@@ -885,13 +903,15 @@ foreachbackend(joinpath(@__DIR__, "test_recorded_run_semantics.jl"))
 foreachbackend(joinpath(@__DIR__, "test_pending_stores.jl"))
 foreachbackend(joinpath(@__DIR__, "test_repeat.jl"))
 foreachbackend(joinpath(@__DIR__, "test_gated_loop_batches.jl"))
+foreachbackend(joinpath(@__DIR__, "test_nested_repeat.jl"))
 foreachbackend(joinpath(@__DIR__, "test_repeat_inner_3d.jl"))
-foreachbackend(joinpath(@__DIR__, "test_traced_usages.jl"))
 foreachbackend(joinpath(@__DIR__, "test_waitidle_submits.jl"))
 foreachbackend(joinpath(@__DIR__, "test_graphics_pipeline.jl"))
 foreachbackend(joinpath(@__DIR__, "test_video_decode.jl"))
 
 foreachbackend(joinpath(@__DIR__, "test_access_kernels.jl"))
+# What the access walk says a dispatch only reads reaches Lava as `Lava.Const`.
+_VULKAN_OK && foreachbackend(joinpath(@__DIR__, "vulkan", "test_readonly_args.jl"))
 foreachbackend(joinpath(@__DIR__, "test_device_array_wrappers.jl"))
 foreachbackend(joinpath(@__DIR__, "test_two_devices.jl"))
 foreachbackend(joinpath(@__DIR__, "test_mapreduce_struct_eltypes.jl"))
@@ -903,6 +923,7 @@ foreachbackend(joinpath(@__DIR__, "test_trace_hwtlas.jl"))
 foreachbackend(joinpath(@__DIR__, "test_trace_hit_record.jl"))
 foreachbackend(joinpath(@__DIR__, "test_trace_procedural.jl"))
 foreachbackend(joinpath(@__DIR__, "test_recorded_plan_runs.jl"))
+foreachbackend(joinpath(@__DIR__, "test_hostwait.jl"))
 foreachbackend(joinpath(@__DIR__, "test_pool_on_device.jl"))
 foreachbackend(joinpath(@__DIR__, "test_stored_device_array.jl"))
 
@@ -1000,7 +1021,8 @@ global METAL_TESTS = joinpath(@__DIR__, "metal")
 
 if _METAL_OK
     @testset "Metal backend" begin
-        for f in ("test_kernelinterface_metal.jl", "test_hwtlas_memory_metal.jl", "test_recording_memory_metal.jl")
+        for f in ("test_kernelinterface_metal.jl", "test_hwtlas_memory_metal.jl",
+                  "test_mtl4_hostwait.jl", "test_recording_memory_metal.jl")
             @testset "$f" begin
                 include(joinpath(METAL_TESTS, f))
             end

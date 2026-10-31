@@ -82,6 +82,21 @@ function _movepatch_walkedplan(dev, src, out, kiout, n)
     return pl
 end
 
+@kernel function movepatch_mark!(dst, n)
+    i = @index(Global)
+    @inbounds if i <= n[1]
+        dst[i] = 1.0f0
+    end
+end
+
+"""Mark the first `n[1]` of `dst`, sized on the device: the prepare reads `n` too."""
+function _movepatch_rangeplan(dev, dst, n, cap)
+    g = M.Graph(dev)
+    M.dispatch!(g, movepatch_mark!, (dst, n), M.DeviceRange(n; max = cap);
+                group = 64, name = "mark")
+    M.record!(M.Plan(g; budget = Inf))
+end
+
 """Two transients alive at once — the placement that forces the arena to grow."""
 function _movepatch_fatplan(dev, n)
     g = M.Graph(dev)
@@ -109,7 +124,7 @@ const _MOVEPATCH_TRI = M.Rasterizer(; vertex = M.VertexShader(_movepatch_tri_ver
 
 @testset "a resize!d buffer under a recorded plan is patched, not re-recorded" begin
     dev = M.Device(TESTBACKEND)
-    be = M.backend(dev)
+    be = dev
     n = 64
     src = M.Buffer(dev, ones(Float32, n))          # capacity == n, so a grow moves it
     out = M.Buffer(dev, zeros(Float32, n))
@@ -134,9 +149,35 @@ const _MOVEPATCH_TRI = M.Rasterizer(; vertex = M.VertexShader(_movepatch_tri_ver
     M.free!(pl)
 end
 
+# The count of a device-sized dispatch is read twice: by the dispatch, whose
+# arguments live in the plan's memory, and by the prepare that sizes it, whose
+# arguments Metal keeps in the recording's auxiliary memory. Only the first was
+# registered for patching there, so after a move the prepare read the vacated
+# count and the dispatch ran its old 64 lanes.
+@testset "a resize!d DeviceRange count is patched where its prepare reads it" begin
+    dev = M.Device(TESTBACKEND)
+    cap = 4096
+    dst = M.Buffer(dev, zeros(Float32, cap))
+    n = M.Buffer(dev, Int32[64])                    # capacity 1, so a grow moves it
+    pl = Base.invokelatest(_movepatch_rangeplan, dev, dst, n, cap)
+    M.run!(pl)
+    M.waitfor!(pl)
+    @test count(==(1f0), Array(M.storage(dst))) == 64
+    rec = pl.recording
+
+    M.resize!(n, cap)
+    copyto!(M.storage(n), fill(Int32(1000), cap))
+    fill!(M.storage(dst), 0f0)
+    M.run!(pl)
+    M.waitfor!(pl)
+    @test pl.recording === rec
+    @test count(==(1f0), Array(M.storage(dst))) == 1000
+    M.free!(pl)
+end
+
 @testset "a resize!d buffer reaches the next run of a walked plan" begin
     dev = M.Device(TESTBACKEND)
-    be = M.backend(dev)
+    be = dev
     n = 64
     src = M.Buffer(dev, ones(Float32, n))
     out = M.Buffer(dev, zeros(Float32, n))
@@ -159,7 +200,7 @@ end
 
 @testset "a buffers arena growing under a recorded plan patches it" begin
     dev = M.Device(TESTBACKEND)
-    be = M.backend(dev)
+    be = dev
     n = 250_000
     small = Base.invokelatest(_movepatch_chainplan, dev, n, 3)
     M.run!(small.plan)                               # recorded at build
@@ -185,7 +226,7 @@ end
 
 @testset "an images arena growing under a recorded plan re-records it" begin
     dev = M.Device(TESTBACKEND)
-    be = M.backend(dev)
+    be = dev
     N = 64
     g = M.Graph(dev)
     img = M.Transient.Image(g, RGBA{Float16}, (N, N))

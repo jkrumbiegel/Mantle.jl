@@ -111,7 +111,8 @@ emitpreparebarrier!(e) = nothing
 """
     workgroupsize(compiled) -> UInt32
 
-Return invocations per workgroup. Traces use one because their indirect counts are rays.
+Invocations per workgroup of a compiled dispatch: what turns its device-written
+item count into the workgroup count of its indirect command.
 """
 function workgroupsize end
 
@@ -129,15 +130,20 @@ Emit a target-to-buffer copy pass.
 """
 function emitcopy! end
 
+"""Record a buffer-to-host transfer, including host visibility, in this run."""
+function emitreadback! end
+
 """
     beginrender!(emitter, plan, passplan) -> handle
-    emitdraw!(emitter, handle, draw)
+    drawcompiled!(emitter, handle, draw)
     endrender!(emitter, handle)
 
-Open attachments, emit draws in order, then close the render pass. The handle is backend-owned.
+Open attachments, emit draws in order, then close the render pass. The handle is
+backend-owned; core sets each draw's viewport and bindings on it (`setviewport!`,
+`use_bindings!`) before `drawcompiled!` packs its arguments and draws it.
 """
 function beginrender! end
-function emitdraw! end
+function drawcompiled! end
 function endrender! end
 
 """
@@ -153,10 +159,33 @@ function compile_dispatch end
 """
     passbarriers(c, pass) -> (images, pre, barrier)
 
-Return image-layout changes, transitions and the memory barrier derived for this pass.
-The default has no explicit dependencies.
+The transitions the `Barriers` phase derived for this pass (`pre`), as the backend
+lowers them: the image ones one by one ([`imagebarriers`](@ref)), since a layout
+change is per image, and the rest into one barrier ([`passbarrier`](@ref)).
 """
-passbarriers(::Compile, ::Pass) = (Nothing[], Transition[], nothing)
+function passbarriers(c::Compile, p::Pass)
+    g = c.graph
+    need = c.prepass[p]
+    isimage(t) = t.resource != 0 && resourcekind(g.ids.by_id[t.resource]) isa ImageKind
+    return imagebarriers(g.dev, g, filter(isimage, need)), need,
+           passbarrier(g.dev, g, filter(!isimage, need))
+end
+
+"""
+    imagebarriers(device, graph, transitions) -> Vector
+
+A pass's image transitions as the backend emits them, one each. None by default:
+a backend that tracks image hazards itself emits no layout changes.
+"""
+imagebarriers(dev, g, ts::Vector{Transition}) = Nothing[]
+
+"""
+    passbarrier(device, graph, transitions)
+
+A pass's other transitions as one barrier the backend emits before it, or `nothing`
+by default, for a backend that orders passes without one.
+"""
+passbarrier(dev, g, ts::Vector{Transition}) = nothing
 
 """
     recordsplans(device) -> Bool
@@ -178,6 +207,10 @@ runscalls(::Device) = false
     resetkernelcompiles!(device)
 
 Report/reset compiled-kernel cache hits and misses. Devices without counters return zeros.
+
+A kernel is compiled once: it is kept by its code, not by the session, so the same code is not
+compiled again later in the session (an edit undone) nor in a later one. Every backend's compiler
+keeps what it compiles in CompilerCaching's object cache, and counts what it finds there as a hit.
 """
 kernelcompiles(::Device) = (; hits = 0, misses = 0)
 resetkernelcompiles!(::Device) = nothing
@@ -298,9 +331,36 @@ function emitinline! end
 """
     collect!(profiler, device)
 
-Read completed timestamp samples without waiting; skip a frame still in flight.
+Read the last profiled frame's GPU timestamps without waiting ([`readstamps`](@ref))
+and sample each pass whose pair is there. A frame still in flight is a skipped
+sample, as is one already sampled whose slots the next frame has not rewritten. A
+host profiler (no timestamp pool) has nothing to read.
 """
-collect!(::Profiler, dev) = nothing
+collect!(::Profiler{Nothing}, dev) = nothing
+function collect!(prof::Profiler, dev)
+    # Core sets `pending` per submission, not per emission: a recording emits its
+    # timestamps once but writes them every run.
+    prof.pending || return prof
+    stamps = readstamps(dev, prof)
+    prof.pending = false
+    for (i, s) in enumerate(stamps)
+        s === nothing && continue
+        lo, hi = s
+        lo == prof.sampled[i] && continue
+        prof.sampled[i] = lo
+        ns = elapsed(lo, hi, prof.period_ns)
+        ns === nothing || sample!(prof.gpu_ns[i], ns)
+    end
+    return prof
+end
+
+"""
+    readstamps(device, profiler) -> Vector{Union{Nothing,Tuple{UInt64,UInt64}}}
+
+Each pass's raw `(start, stop)` timestamps from the profiler's pool, in ticks of its
+`period_ns`, or `nothing` where the pair is not available yet. Without waiting.
+"""
+function readstamps end
 
 """
     syncbackend(device) -> Backend
@@ -308,6 +368,11 @@ collect!(::Profiler, dev) = nothing
 Return the backend marker used to lower transitions into stages, access masks and layouts.
 """
 function syncbackend end
+
+"""Whether recorded runs and loop iterations start behind a full buffer memory
+dependency, including host stores emitted in front of the recording. Core uses
+this native fact only for plans that actually take the recorded route."""
+buffer_head_ordered(::Any) = false
 
 """
     profiled!(f, plan, emitter, i)
@@ -493,10 +558,10 @@ const BACKEND_VOCABULARY = (
     :initbackend!,
     :devicename,
     # Runtime hooks outside the graph (runtime/backendhooks.jl).
-    :staged_gemm_tile, :videodecodes, :decode_h264_gpu, :h264decoder, :feed!, :decodemore!, :remaining, :build_blas_aabb, :copytexels!,
+    :staged_gemm_tile, :videodecodes, :decode_h264_gpu, :h264decoder, :feed!, :decodemore!, :remaining, :copytexels!,
     :isoutofmemory,
     # devices, memory, resources
-    :Device, :backend, :kibackend, :batchqueue, :capacity, :caps, :maxalloc, :pool,
+    :Device, :batchqueue, :capacity, :caps, :maxalloc, :pool,
     # Core answers these for `SubmitChannel`; a backend answers for its own channel
     # type (Metal.jl's `BatchedCommandQueue`).
     :todevice, :reclaim!,
@@ -523,25 +588,28 @@ const BACKEND_VOCABULARY = (
     # What `record_draw!` bakes per argument; a device array answers with its
     # address, so a cached plan sees a reallocation.
     :argidentity,
-    :setviewport!, :colorimage, :depthimage, :currentimage, :blittarget,
+    :setviewport!, :colorimage, :depthimage, :currentimage, :depthformat, :packedsize,
     :storage, :resourcekind, :makeimage, :remakeimage!, :AdaptedAccel, :mipmapped,
     :supports, :supports_graphics, :supports_geometry_stage,
     :supports_tessellation, :supports_mesh_pipeline, :supports_batch_queue,
-    :supports_rt_pipeline, :supports_procedural_traversal, :supports_hwtlas, :supports_float64, :supports_int64_atomics,
+    :supports_procedural_traversal, :supports_hwtlas, :supports_float64, :supports_int64_atomics,
     :supportspredicate,                       # only whether fixed-size gated work can be discarded
     # Device lifecycle, validation and allocation probes (runtime/lifecycle.jl).
     :debugenv, :validating, :validationmessages!, :submissions, :retired, :tryallocate,
-    :devices, :defaultdevice!,
+    :devices, :makedevice, :remakedevice, :adopt!,
     # the queue and its tokens; the backend builds core's channel around its driver half
     :SubmitChannel,
-    :allocate_batch_queue!, :release_batch_queue!, :submit!, :flush!, :waitidle,
-    :waitfor, :waitfor!, :passed, :fence, :reset_device!, :awaitwrites,
+    :newchannel, :closechannel!, :submit!, :flush!, :waitidle, :oneshot!,
+    :issued, :awaittoken!, :waitfor!, :passed, :fence, :reset_device!, :awaitwrites,
     # sync lowering
-    :access, :stages, :layout, :needs_transition,
+    :access, :stages, :layout, :needs_transition, :global_buffer_barriers,
     # Vendor verbs (`vkformat`, `mtlformat`) are backend-private and not listed.
+    # A backend names its pixel formats through `nativeformat`; core owns the table
+    # (`runtime/format.jl`).
+    :nativeformat,
     # compile: the phases are core's, a backend answers these
     :syncbackend,
-    :compiledraw, :compile_dispatch, :passbarriers,
+    :compiledraw, :compile_dispatch, :imagebarriers, :passbarrier,
     :argbytes, :indirectslot,
     # Argument packing is core's (`graph/packing.jl`); a backend adds `passedas`
     # only for its own allocation handles.
@@ -558,17 +626,18 @@ const BACKEND_VOCABULARY = (
     # (`partitionranges`); and the budget.
     :timestamps, :submissionbudget,
     # Also read from backend-specific compiled dispatches.
-    :argsize, :devicesized, :indirectindex,
+    :argsize, :indirectindex,
     # Core defines a default for each; a backend overrides it.
     :retire!, :blocksize, :copy_target!, :gpupasstime!, :passbegin!, :passend!,
     # the walk's primitives
     :openrecording, :closerecording!, :emithead!, :emitloophead!, :emitbarriers!,
     :withpredicate,
-    :emitupdate!, :emitdispatch!, :emitcopy!, :beginrender!, :emitdraw!, :endrender!,
-    :collect!,
+    :emitupdate!, :emitdispatch!, :emitcopy!, :emitreadback!, :nativebuffercopy, :readbackbinding, :samereadback,
+    :beginrender!, :drawcompiled!, :endrender!,
+    :readstamps,
     :emitkernel!, :emitpreparebarrier!, :workgroupsize, :indirectslot, :writegroups!, :slotgrid,
     :storebytes!, :orderstore!,
-    :recordsplans, :recordable, :runscalls, :librarygemm, :native_gemm_available,
+    :recordsplans, :recordable, :recordablekind, :buffer_head_ordered, :recordspass, :recordsprofiled, :runscalls, :librarygemm, :native_gemm_available,
     :native_conv2d_dispatch!,
     :native_gemm_dispatch!, :native_batched_gemm_dispatch!,
     :native_attention_dispatch!,
@@ -578,21 +647,26 @@ const BACKEND_VOCABULARY = (
     :openrun, :closerun!, :abandonrun!, :abandonframe!, :emitinline!,
     # Submit one baked piece, or give back one never submitted; core owns the
     # partition (`RecordingParts`).
-    :submitrecording!, :abandonrecording!,
-    :beginframe!,
-    # graphics verbs, immediate and windowed
-    :Framebuffer, :Window, :Surface, :Texture2D, :Sampler, :screenshot,
-    :acquire_next_image!, :present_frame!, :begin_pass!, :end_pass!, :draw!,
-    :draw_in_pass!, :draw_indexed_in_pass!, :draw_indirect_in_pass!, :set_viewport!,
+    :submitrecording!, :submitpiece!, :abandonrecording!,
+    # graphics verbs, immediate and windowed; a window's are its surface's
+    # (`graphics/window.jl`)
+    :windowsurface, :fitsurface!, :closesurface!,
+    :makeframebuffer, :maketexture, :makesampler, :Surface,
+    :acquire_next_image!, :present_frame!,
     :use_bindings!, :bind_textures, :readback_framebuffer, :readback_target,
     :readback_window, :target_extent, :target_format, :target_image, :target_view,
     # Core infers accesses; backends supply adapted argument types, interpreters
     # and stage-wrapper signatures.
-    :argtype, :devicebuffertype, :isdevicearray, :accesscache, :kerneltouches,
+    :argtype, :devicebuffertype, :isdevicearray, :resource_identity, :accesscache, :kerneltouches,
     :kernelinterpreter, :kakernelaccesssignature,
-    :vertextouches, :fragmenttouches, :shadertouches,
-    # ray tracing
-    :build_accel!, :build_blas, :refit_tlas!,
-    # Native batch hooks apply only to hardware BatchedTLAS implementations.
-    :buildgeometry!, :geometryref, :instancearray, :updatebatch!,
+    :vertextouches, :fragmenttouches,
+    # ray tracing: the native structures under core's builds (`raytracing/api.jl`) and its
+    # `BatchedTLAS` (`raytracing/mutation.jl`)
+    :build_accel!, :buildnative!, :refitnative!, :refittable, :refitinput, :inputarray,
+    :blastype, :nativerecords, :geometryvalue, :instancerecord, :scenevalue,
+    # the ray query core's traversal loops (`query_record`, `query_transparent`) drive: device code
+    :query_begin, :query_begin_transparent, :query_next!, :candidate_is_box,
+    :candidate_primitive_index, :candidate_object_ray, :candidate_ids, :candidate_triangle,
+    :commit_triangle!, :commit_intersection!, :committed_kind, :committed_ids,
+    :committed_barycentrics, :query_end!,
 )

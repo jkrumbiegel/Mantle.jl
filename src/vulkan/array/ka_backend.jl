@@ -34,26 +34,12 @@ Adapt.adapt_structure(::LavaAdaptor, ::LavaDevice) = LavaDeviceBackend()
 # `Vulkan.Instance` (see `graph/lifetime.jl`) and overflows the stack.
 holdleaves!(holder, ::LavaDevice) = nothing
 
-"""
-    vk_context(a::LavaArray) -> LavaDevice
-
-The device an array belongs to, read from its buffer. Use it instead of the
-global `vk_context()` whenever an array is at hand.
-"""
-vk_context(a::LavaArray) = (a.buf[].ctx)::LavaDevice
-# `caps` is `KernelInterface.caps` (imported in `Mantle.jl`), so libraries query
-# a device through its array.
-caps(a::LavaArray) = caps(vk_context(a))
 # Core's query (`runtime/backendhooks.jl`), fixed at device creation.
 videodecodes(ctx::LavaDevice) = ctx.video_decode_available
 # Queried from the physical device, as device creation does before enabling it.
 supports_int64_atomics(ctx::LavaDevice) =
     VK.get_physical_device_features_2(ctx.physical_device,
         VK.PhysicalDeviceVulkan12Features).next.shader_buffer_int_64_atomics
-# A view is on its parent's device, for every `AnyLavaArray` wrapper.
-vk_context(a::Union{SubArray, Base.ReshapedArray, PermutedDimsArray,
-                     LinearAlgebra.Transpose, LinearAlgebra.Adjoint}) = vk_context(parent(a))
-
 # The array's own device, not the global default.
 KA.get_backend(a::LavaArray) = (a.buf[].ctx)::LavaDevice
 # Wait for all work submitted on the device's default channel, so the host can
@@ -80,8 +66,7 @@ function KA.copyto!(::LavaDevice, A, B)
 end
 
 # `Adapt.adapt(device, x)` uploads to the device; `Adapt.adapt(LavaArray, x)`
-# uses the process default device. Concrete because core routes
-# `adapt_storage(::Device, x)` to the device's backend, which a device is.
+# uses the process default device.
 Adapt.adapt_storage(d::LavaDevice, a::Array) = LavaArray(a; bq = d.default_bq)
 Adapt.adapt_storage(::LavaDevice, x) = x
 
@@ -100,10 +85,11 @@ function alloc_index_buffer(bq::SubmitChannel{<:VulkanQueue}, data::AbstractVect
 end
 Adapt.adapt_storage(::KA.CPU, a::LavaArray) = Array(a)
 
-# `@Const` leaves a device array as is: its BDA pointer can already be read-only.
+# `@Const` wraps a device array in `Lava.Const`, whose loads Lava declares
+# NonWritable; `readonlyargs` adapts the arguments a dispatch only reads the same way.
 # KA 0.10 rebuilds reshaped and permuted wrappers around the adapted parent
 # without re-validating, so no throwing `reshape` constructor reaches the device.
-Adapt.adapt_storage(::KA.ConstAdaptor, a::LavaDeviceArray) = a
+Adapt.adapt_storage(::KA.ConstAdaptor, a::LavaDeviceArray) = Lava.Const(a)
 
 # `adapt(LavaArray, x)` names a type, not a device, so it allocates on the
 # process default device. ambient-allocation-ok
@@ -170,13 +156,6 @@ function KA.launch_config(kernel::KA.Kernel{LavaDevice}, ndrange, workgroupsize)
     return ndrange, workgroupsize, iterspace, dynamic
 end
 
-function KA.mkcontext(kernel::KA.Kernel{LavaDevice}, _ndrange, iterspace)
-    KA.CompilerMetadata{KA.ndrange(kernel), KA.DynamicCheck}(_ndrange, iterspace)
-end
-
-function KA.mkcontext(kernel::KA.Kernel{LavaDevice}, I, _ndrange, iterspace, ::Dynamic) where Dynamic
-    KA.CompilerMetadata{KA.ndrange(kernel), Dynamic}(I, _ndrange, iterspace)
-end
 
 # Pure conversion for type reflection; launch paths hold the originals with
 # `holdleaves!`.
@@ -238,30 +217,26 @@ function get_or_build_iter_plan(obj::KA.Kernel{LavaDevice}, ndrange, workgroupsi
         end
     end
 
-    ndr_canon, _, iterspace, _ = KA.launch_config(obj, ndrange, workgroupsize)
-    ka_ctx  = KA.mkcontext(obj, ndr_canon, iterspace)
-    blocks  = KA.blocks(iterspace)
-    nblocks = length(blocks)
-    if nblocks == 0
-        new_plan = IterPlan(ka_ctx, (0, 0, 0), (0, 0, 0), 0)
-    else
-        block_dims = pad_to_3d(vkctx, size(blocks))
-        nthreads   = length(KA.workitems(iterspace))
-        ws_3d      = (nthreads, 1, 1)
-        new_plan   = IterPlan(ka_ctx, block_dims, ws_3d, nblocks)
-    end
+    s = launchshape(obj, ndrange, workgroupsize)
+    nblocks = groupcount(s)
+    # The workgroup is flat: KA's context maps the linear local index back to the
+    # partition's axes.
+    new_plan = nblocks == 0 ? IterPlan(s.ctx, (0, 0, 0), (0, 0, 0), 0) :
+        IterPlan(s.ctx, pad_to_3d(vkctx, size(KA.blocks(s.iterspace))),
+                 (groupthreads(s), 1, 1), nblocks)
     push!(get!(() -> Any[], cache, typeof(obj)), IterEntry{K}(k, new_plan))
     return new_plan
 end
 
 """
-    launchindirect!(bq, obj, args, count, workgroupsize, tlas)
+    launchindirect!(bq, obj, args, count, ceiling, workgroupsize, tlas)
 
 Launch `obj` over the element count in the device array `count` as one
 one-shot: the prepare that turns it into group counts, a barrier, the dispatch.
-`count` is held like an argument, because only the prepare names it.
+`count` is held like an argument, because only the prepare names it. The kernel
+is compiled against `ceiling` items (core's `dispatchrange`).
 """
-function launchindirect!(bq, obj, args, count::LavaArray, workgroupsize, tlas)
+function launchindirect!(bq, obj, args, count::LavaArray, at::Int, ceiling::Int, workgroupsize, tlas)
     oneshot!(bq; tag = :launch) do e
         owner = e.owner
         holdleaves!(owner, obj.f)
@@ -269,7 +244,7 @@ function launchindirect!(bq, obj, args, count::LavaArray, workgroupsize, tlas)
         holdleaves!(owner, count)
         adaptor = LavaAdaptor(owner)
         converted_args = argmap(a -> Adapt.adapt(adaptor, a), args)
-        ka_launch_indirect!(e, obj, converted_args, count, workgroupsize, args, adaptor, tlas)
+        ka_launch_indirect!(e, obj, converted_args, count, at, ceiling, workgroupsize, args, adaptor, tlas)
     end
     return nothing
 end
@@ -284,11 +259,12 @@ function (obj::KA.Kernel{LavaDevice})(args...; ndrange=nothing, workgroupsize=no
     tlas = find_tlas_in_args(args)
 
     # A device-resident count (`DeviceRange` or `LavaArray`) launches indirectly,
-    # without a readback; the `DeviceRange` ceiling is unused here.
+    # without a readback, compiled against the same ceiling as a graph's dispatch.
     ndrange isa DeviceRange &&
-        return launchindirect!(bq, obj, args, storage(ndrange.count), workgroupsize, tlas)
+        return launchindirect!(bq, obj, args, storage(ndrange.count), ndrange.at, dispatchrange(ndrange),
+                               workgroupsize, tlas)
     ndrange isa LavaArray &&
-        return launchindirect!(bq, obj, args, ndrange, workgroupsize, tlas)
+        return launchindirect!(bq, obj, args, ndrange, 1, INDIRECT_CEILING, workgroupsize, tlas)
 
     # KA's launch configuration plus `pad_to_3d` cost about half the host time of
     # a launch and depend only on kernel type and shape, so the plan is cached.
@@ -306,26 +282,39 @@ end
     block_dims = plan.block_dims
     ws_3d      = plan.ws_3d
 
+    # Before the one-shot, so a kernel the access walk refuses opens no command buffer.
+    touches = katouches(obj, args, plan)
     # One command buffer per launch, never joining an open batch, which would
     # depend on task-global state; batching is what a declared graph is for.
     oneshot!(bq; tag = :launch) do e
-        emitlaunch!(e, obj, args, ka_ctx, block_dims, ws_3d, tlas)
+        emitlaunch!(e, obj, args, touches, ka_ctx, block_dims, ws_3d, tlas)
     end
     return nothing
 end
 
-# Shared by both launch paths: hold every leaf of the closure and arguments in
-# the one-shot, then adapt (which holds nothing) and launch.
-@inline function emitlaunch!(e, obj, args, ka_ctx, block_dims, ws_3d, tlas)
+# Hold every leaf of the closure and arguments in the one-shot, then adapt (which
+# holds nothing) and launch.
+@inline function emitlaunch!(e, obj, args, touches, ka_ctx, block_dims, ws_3d, tlas)
     owner = e.owner
     holdleaves!(owner, obj.f)
     holdleaves!(owner, args)
     adaptor = LavaAdaptor(owner)
     converted_f = Adapt.adapt(adaptor, obj.f)
     converted_args = argmap(a -> Adapt.adapt(adaptor, a), args)
-    all_args = (converted_f, ka_ctx, converted_args...)
-    ka_launch!(e, converted_f, all_args, block_dims, ws_3d, tlas)
+    # Which arguments `readonlyargs` wraps is decided per call (two may share a
+    # buffer), so its result has no inferable type: one dynamic call into the launch,
+    # taken only when there is something to wrap.
+    any(isreadonly, touches) &&
+        return launchwith!(e, converted_f, ka_ctx,
+                           readonlyargs(nothing, touches, args, converted_args),
+                           block_dims, ws_3d, tlas)
+    launchwith!(e, converted_f, ka_ctx, converted_args, block_dims, ws_3d, tlas)
 end
+
+# `::F`: a function argument only passed on is not specialised on, and an abstract
+# `f` boxes the argument tuple.
+@noinline launchwith!(e, f::F, ka_ctx, args::Tuple, block_dims, ws_3d, tlas) where {F} =
+    ka_launch!(e, f, (f, ka_ctx, args...), block_dims, ws_3d, tlas)
 
 # Vulkan dispatches are at most 3-D: `pad_to_3d` maps the block grid onto
 # `ctx.max_wg_dims`, splitting large dimensions across Y and Z. Extra workgroups
@@ -439,7 +428,7 @@ The kernel-independent half of `build_launch_plan!`, inferred once. The
         deviceof(bq), f, tt, wg; enable_ray_query=ray_query)
     base = compiled.push_info.arg_buffer_size
     p = LaunchPlan(compiled, pipeline, offsets, byval_sizes, base,
-                   base + compute_inline_extra_from_byval(byval_sizes),
+                   base + compute_inline_extra_from_byval(byval_sizes, base),
                    world, wg, ray_query)
     v = get!(() -> Any[], launch_plan_cache(deviceof(bq)), key)
     filter!(q -> (q::LaunchPlan).world === world, v)  # superseded worlds are dead
@@ -467,8 +456,8 @@ function ka_launch!(e::Emitter, @nospecialize(f), all_args::Tuple,
     arg_buf = get_arg_buffer(owner, plan.total_size)
 
     # `all_args` is post-adapt; the caller already held the original leaves.
-    pack_args_direct!(owner, arg_buf.mapped_ptr, arg_buf.address, plan.offsets,
-                       plan.arg_buffer_size, plan.byval_sizes, all_args)
+    pack_args_direct!(owner, arg_buf, plan.offsets, plan.arg_buffer_size,
+                      plan.byval_sizes, all_args)
 
     name = ""
     if (deviceof(bq)).diag.dispatch_logging
@@ -482,57 +471,26 @@ end
 
 # Indirect dispatch. Kernels take `LavaDeviceArray`s, never raw pointers.
 
-function prepare_indirect_kernel(indirect::LavaDeviceArray{UInt32,1},
-                                  ndrange_buf::LavaDeviceArray{Int32,1},
-                                  ws::UInt32)
-    n = UInt32(ndrange_buf[1])
-    groups = (n + ws - UInt32(1)) ÷ ws
-    indirect[1] = groups         # groupCountX
-    indirect[2] = UInt32(1)      # groupCountY
-    indirect[3] = UInt32(1)      # groupCountZ
-    return nothing
-end
-
-function prepare_indirect_dispatch!(e::Emitter,
-                                    indirect::LavaArray{UInt32,1},
-                                    ndrange_buf::LavaArray{<:Integer},
-                                    workgroup_size::Integer)
-    emitkernel!(e, prepare_indirect_kernel,
-                indirect, ndrange_buf, UInt32(workgroup_size);
-                ndrange=1, workgroup_size=(1, 1, 1))
-end
-
 """
-    ka_launch_indirect!(e, obj, args, ndrange_buf, workgroupsize, original_args, adaptor, tlas)
+    ka_launch_indirect!(e, obj, args, ndrange_buf, at, ceiling, workgroupsize, original_args, adaptor, tlas)
 
 Record an indirect launch of `obj` into `e`: a prepare kernel turns the item
-count in `ndrange_buf` (1-element `Int32`) into group counts, a barrier makes
-them visible, and the dispatch reads them.
+count `ndrange_buf[at]` into group counts, a barrier makes them visible, and the
+dispatch reads them.
 """
-function ka_launch_indirect!(e::Emitter, obj, args, ndrange_buf::LavaArray, workgroupsize,
-                             original_args, adaptor::LavaAdaptor,
+function ka_launch_indirect!(e::Emitter, obj, args, ndrange_buf::LavaArray, at::Int, ceiling::Int,
+                             workgroupsize, original_args, adaptor::LavaAdaptor,
                              tlas=nothing)  # positional, as in ka_launch!
     bq = queueof(e)
-    # Keyword, then the `@kernel` static size, then 256.
-    ws = if workgroupsize !== nothing
-        workgroupsize isa Integer ? (workgroupsize,) : workgroupsize
-    elseif KA.workgroupsize(obj) <: KA.StaticSize
-        KA.get(KA.workgroupsize(obj))
-    else
-        (256,)
-    end
-    ws_3d = pad_to_3d(deviceof(bq), ws)
-    ws_prod = prod(ws)
-
-    # The group count comes from the indirect buffer. A large ndrange makes
-    # `__validindex` pass for every thread; the kernel must bound itself against
-    # the real count (e.g. `i <= queue.size[1]`).
-    big_ndrange = (1024 * 1024 * ws_prod,)
-    ndrange_tuple = length(ws) == 1 ? big_ndrange :
-                    length(ws) == 2 ? (big_ndrange[1], 1) :
-                    (big_ndrange[1], 1, 1)
-    iterspace, dynamic = KA.partition(obj, ndrange_tuple, ws)
-    ctx = KA.mkcontext(obj, ndrange_tuple, iterspace)
+    # The group count comes from the indirect buffer. Compiled against the
+    # ceiling, so `__validindex` passes every thread the count launches; the
+    # kernel bounds itself against the real count (e.g. `i <= queue.size[1]`).
+    # The group is the launch's, else the `@kernel` static size, else core's
+    # default, as for a host-sized launch.
+    shape = launchshape(obj, (ceiling,), callgroup(obj, workgroupsize))
+    ws_prod = groupthreads(shape)
+    ws_3d = (ws_prod, 1, 1)
+    ctx = shape.ctx
 
     # The caller held the arguments; hold the closure's captures as well.
     batch = adaptor.batch
@@ -546,15 +504,15 @@ function ka_launch_indirect!(e::Emitter, obj, args, ndrange_buf::LavaArray, work
     compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
         deviceof(bq), converted_f, tt, ws_3d; enable_ray_query)
 
-    inline_extra = compute_inline_extra_from_byval(byval_sizes)
+    inline_extra = compute_inline_extra_from_byval(byval_sizes, compiled.push_info.arg_buffer_size)
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
     # Keep the pre-adapt arrays reachable while their addresses are packed.
     GC.@preserve original_args begin
 
     arg_buf = get_arg_buffer(batch, total_size)
-    pack_args_direct!(batch, arg_buf.mapped_ptr, arg_buf.address, offsets,
-                       compiled.push_info.arg_buffer_size, byval_sizes, all_args)
+    pack_args_direct!(batch, arg_buf, offsets, compiled.push_info.arg_buffer_size,
+                      byval_sizes, all_args)
 
     indirect_view = indirect_command!(batch)
 
@@ -564,11 +522,11 @@ function ka_launch_indirect!(e::Emitter, obj, args, ndrange_buf::LavaArray, work
                                  dispatch_name(obj.f, all_args))::String
         driver(bq).last_dispatch_info = name
     end
-    # Prepare, barrier for the indirect read, dispatch. Graph passes fuse their
-    # prepares instead (`emitprepares!`).
-    prepare_indirect_dispatch!(e, indirect_view, ndrange_buf, ws_prod)
-    indirectbarrier!(e, VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-                     VK.ACCESS_INDIRECT_COMMAND_READ_BIT)
+    # Core's prepare for one ungated dispatch, barrier for the indirect read,
+    # dispatch. Graph passes fuse their prepares (`emitprepares!`).
+    emitkernel!(e, multi_prepare_indirect_kernel, (indirect_view,), (ndrange_buf,), (Int32(at),),
+                (UInt32(ws_prod),), nothing; ndrange = 1, workgroup_size = (1, 1, 1))
+    emitpreparebarrier!(e)
     emit_dispatch!(e, pipeline, arg_buf.address, indirect_view, tlas, name)
 
     end # GC.@preserve

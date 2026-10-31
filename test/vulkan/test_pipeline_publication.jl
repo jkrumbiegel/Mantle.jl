@@ -16,7 +16,7 @@ function check_pipeline_publication(ctx, other=nothing)
             vertex=Mantle.VertexShader(publication_vertex; outputs=(tint=NTuple{4,Float32},)),
             fragment=Mantle.FragmentShader(publication_fragment),
             cull=Mantle.NoCull(), depth=Mantle.DepthOff())
-        compile(d) = Mantle.compile_draw(d, description, (RGBA{Float32},), nothing, (), ()).pipeline
+        compile(d) = Mantle.compile_draw(d, description, (Mantle.pixelformat(Mantle.VulkanAPI(), RGBA{Float32}),), nothing, (), ()).pipeline
         # Compile Julia stages before concurrent native creation. Queue submission
         # itself is task-owned and is deliberately performed on the caller only.
         warm = compile(dev)
@@ -32,12 +32,11 @@ function check_pipeline_publication(ctx, other=nothing)
 
         # Element types cannot distinguish these native attachment formats.
         for format in (Mantle.VK.FORMAT_R8G8B8A8_SRGB,Mantle.VK.FORMAT_R8G8B8A8_UNORM)
-            draw = Mantle.compile_vulkan_draw(dev,description,Mantle.VK.Format[format],
-                                              Mantle.VK.FORMAT_UNDEFINED,(),())
+            draw = Mantle.compile_draw(dev,description,(format,),nothing,(),())
             @test draw.pipeline.color_formats == [format]
         end
 
-        fb = Mantle.Framebuffer(Mantle.backend(dev), 8, 8; depth=false, color_format=RGBA{Float32})
+        fb = Mantle.Framebuffer(dev, 8, 8; depth=false, color_format=RGBA{Float32})
         Mantle.draw!(dev, description, Mantle.OffscreenTarget(fb), 3)
         Mantle.flush!(dev)
         @test all(p -> p.g > 0.99f0 && p.r < 0.01f0, Mantle.readback_framebuffer(fb))

@@ -38,7 +38,8 @@ stages(::VulkanAPI, ::Type{Sampled}, _) = stage(SHADER_STAGES)
 stages(::VulkanAPI, ::Type{<:Storage}, _) = stage(SHADER_STAGES)
 stages(::VulkanAPI, ::Type{CopySrc}, _) = stage(VK.PIPELINE_STAGE_2_COPY_BIT)
 stages(::VulkanAPI, ::Type{CopyDst}, _) = stage(VK.PIPELINE_STAGE_2_COPY_BIT)
-stages(::VulkanAPI, ::Type{TraceRead}, _) = stage(VK.PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR)
+# A ray query reads the structure from whichever shader stage traces.
+stages(::VulkanAPI, ::Type{TraceRead}, _) = stage(SHADER_STAGES)
 stages(::VulkanAPI, ::Type{TraceBuild}, _) = stage(VK.PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR)
 stages(::VulkanAPI, ::Type{<:ColorAttachment}, _) = stage(VK.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT)
 
@@ -88,13 +89,6 @@ end
 stages(be::VulkanAPI, ::Type{Unordered{U}}, d) where {U} = stages(be, U, d)
 access(be::VulkanAPI, ::Type{Unordered{U}}, d) where {U} = access(be, U, d)
 layout(be::VulkanAPI, ::Type{Unordered{U}}, d) where {U} = layout(be, U, d)
-
-# `Traced` changes only the stage, to RAY_TRACING_SHADER; access and layout are
-# the inner usage's.
-stages(::VulkanAPI, ::Type{Traced{U}}, _) where {U} =
-    stage(VK.PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR)
-access(be::VulkanAPI, ::Type{Traced{U}}, d) where {U} = access(be, U, d)
-layout(be::VulkanAPI, ::Type{Traced{U}}, d) where {U} = layout(be, U, d)
 
 # A discarding load op reads nothing back, so the read bit is dropped.
 access(::VulkanAPI, ::Type{ColorAttachment{Discard}}, _) where {Discard} =
@@ -148,45 +142,19 @@ function needs_transition(be::VulkanAPI, kind::ImageKind, before::Type, after::T
 end
 
 
-"""
-    vkformat(api, T; srgb = false) -> VK.Format
-
-The Vulkan format a Julia element type is stored in. `srgb` is a flag, not a
-type, because sRGB and UNORM share a memory layout. Backend-local, like Metal's
-`mtlformat`.
-"""
-function vkformat end
-
-vkformat(::VulkanAPI, ::Type{RGBA{N0f8}}; srgb::Bool = false) =
+# Vulkan's value for each of core's pixel layouts (`runtime/format.jl`).
+nativeformat(::VulkanAPI, ::Type{RGBA{N0f8}}, srgb::Bool) =
     srgb ? VK.FORMAT_R8G8B8A8_SRGB : VK.FORMAT_R8G8B8A8_UNORM
-vkformat(::VulkanAPI, ::Type{BGRA{N0f8}}; srgb::Bool = false) =
+nativeformat(::VulkanAPI, ::Type{BGRA{N0f8}}, srgb::Bool) =
     srgb ? VK.FORMAT_B8G8R8A8_SRGB : VK.FORMAT_B8G8R8A8_UNORM
-vkformat(::VulkanAPI, ::Type{RGBA{Float16}}; srgb::Bool = false) =
-    srgb ? error("there is no sRGB half-float format") : VK.FORMAT_R16G16B16A16_SFLOAT
-vkformat(::VulkanAPI, ::Type{RGBA{Float32}}; srgb::Bool = false) =
-    srgb ? error("there is no sRGB float format") : VK.FORMAT_R32G32B32A32_SFLOAT
-# Depth-ness is the usage, not the element type: this is D32_SFLOAT because
-# nothing else in Vulkan is a single-component 32-bit float attachment.
-vkformat(::VulkanAPI, ::Type{Float32}; srgb::Bool = false) = VK.FORMAT_D32_SFLOAT
-vkformat(::VulkanAPI, ::Type{UInt32}; srgb::Bool = false) =
-    srgb ? error("there is no sRGB integer format") : VK.FORMAT_R32_UINT
-vkformat(::VulkanAPI, ::Type{<:StaticVector{2,UInt32}}; srgb::Bool = false) =
-    srgb ? error("there is no sRGB integer format") : VK.FORMAT_R32G32_UINT
-# Tuple spellings, as portable shaders write them.
-vkformat(api::VulkanAPI, ::Type{NTuple{4,UInt8}}; srgb::Bool = false) = vkformat(api, RGBA{N0f8}; srgb)
-vkformat(api::VulkanAPI, ::Type{NTuple{4,Float32}}; srgb::Bool = false) = vkformat(api, RGBA{Float32}; srgb)
-vkformat(::VulkanAPI, ::Type{NTuple{3,Float32}}; srgb::Bool = false) =
-    srgb ? error("there is no sRGB float format") : VK.FORMAT_R32G32B32_SFLOAT
-vkformat(::VulkanAPI, ::Type{NTuple{2,Float32}}; srgb::Bool = false) =
-    srgb ? error("there is no sRGB float format") : VK.FORMAT_R32G32_SFLOAT
-vkformat(::VulkanAPI, ::Type{UInt8}; srgb::Bool = false) =
-    srgb ? error("there is no single-channel sRGB format") : VK.FORMAT_R8_UNORM
-
-"""
-    vksampledformat(T) -> VK.Format
-
-The format of a sampled texture of `T`: as [`vkformat`](@ref), except that a
-scalar `Float32` is `R32_SFLOAT`, since a sampler rejects the depth format.
-"""
-vksampledformat(::Type{Float32}) = VK.FORMAT_R32_SFLOAT
-vksampledformat(T::Type) = vkformat(VulkanAPI(), T)
+nativeformat(::VulkanAPI, ::Type{RGBA{Float16}}, ::Bool) = VK.FORMAT_R16G16B16A16_SFLOAT
+nativeformat(::VulkanAPI, ::Type{RGBA{Float32}}, ::Bool) = VK.FORMAT_R32G32B32A32_SFLOAT
+nativeformat(::VulkanAPI, ::Type{Depth32}, ::Bool) = VK.FORMAT_D32_SFLOAT
+nativeformat(::VulkanAPI, ::Type{Float32}, ::Bool) = VK.FORMAT_R32_SFLOAT
+nativeformat(::VulkanAPI, ::Type{Float16}, ::Bool) = VK.FORMAT_R16_SFLOAT
+nativeformat(::VulkanAPI, ::Type{UInt32}, ::Bool) = VK.FORMAT_R32_UINT
+nativeformat(::VulkanAPI, ::Type{SVector{2,UInt32}}, ::Bool) = VK.FORMAT_R32G32_UINT
+nativeformat(::VulkanAPI, ::Type{NTuple{3,Float32}}, ::Bool) = VK.FORMAT_R32G32B32_SFLOAT
+nativeformat(::VulkanAPI, ::Type{NTuple{2,Float32}}, ::Bool) = VK.FORMAT_R32G32_SFLOAT
+nativeformat(::VulkanAPI, ::Type{NTuple{2,Float16}}, ::Bool) = VK.FORMAT_R16G16_SFLOAT
+nativeformat(::VulkanAPI, ::Type{UInt8}, ::Bool) = VK.FORMAT_R8_UNORM

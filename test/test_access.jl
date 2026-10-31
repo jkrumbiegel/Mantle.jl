@@ -6,7 +6,20 @@
 # What is here is the part that has no backend in it: whether a type can reach
 # memory at all, and what a `Touch` means as a usage.
 using Test, Mantle
+using GPUCompiler
 const M = Mantle
+
+@testset "reflection failure is not an inferred no-access proof" begin
+    rows=Base.code_ircode_by_type(Tuple{typeof(identity),Int})
+    @test length(rows)==1 && first(only(rows)) isa Core.Compiler.IRCode
+    ir=first(only(rows))
+    @test M.inferred_access_ir(rows)===ir
+    @test M.inferred_access_ir([which(identity,(Int,))=>Any])===nothing
+    @test M.inferred_access_ir([nothing=>Any])===nothing
+    @test M.inferred_access_ir([ir=>Union{}])===nothing
+    @test M.inferred_access_ir([])===nothing
+    @test M.inferred_access_ir([ir=>Int,ir=>Int])===nothing
+end
 
 @testset "inferred access: the unknown is refused, not guessed at" begin
     # `accessof` on a signature nothing can be inferred for must not answer
@@ -39,6 +52,40 @@ const M = Mantle
     @test M.usagetype(M.ATOMIC, M.BufferKind()) ===
           Unordered{Storage{BufferKind, ReadWrite}}
     @test M.usagetype(M.READ, M.BufferKind()) === Storage{BufferKind, ReadOnly}
+end
+
+# A dynamic call names its callee. A generated kernel called `Atomix.atomic_max`,
+# which Atomix does not define; the refusal said "a call to `%12`", and that was
+# the whole of the runtime feedback a repair attempt was given. The callee is a
+# `getglobal(Atomix, :atomic_max)` statement, so the module and name are known.
+module NoSuchMember end
+function callsmissing(out::Ptr{Float32})
+    NoSuchMember.atomic_max(out, 1, 2f0, :monotonic)
+    return
+end
+callsdefined(out::Ptr{Float32}, f) = (f(out); return)
+
+@testset "a refused dynamic call names its callee" begin
+    err = try
+        M.accessof(nothing, callsmissing, (Ptr{Float32},))
+        nothing
+    catch e
+        e
+    end
+    @test err isa M.UnanalysableAccess
+    msg = sprint(showerror, err)
+    @test occursin("NoSuchMember.atomic_max", msg)
+    @test occursin("does not define", msg)
+    @test !occursin("call to `%", msg)
+    # A callee that exists but stays dynamic is still named, and not called missing.
+    err = try
+        M.accessof(nothing, callsdefined, (Ptr{Float32}, Any))
+        nothing
+    catch e
+        e
+    end
+    @test err isa M.UnanalysableAccess
+    @test !occursin("does not define", sprint(showerror, err))
 end
 
 # A device address laundered through an integer is still an address.
@@ -82,4 +129,71 @@ end
     # the fix. Before `carries` was consulted at all, an argument whose length a
     # kernel read came back read+write.
     @test t[4] === M.NOTOUCH
+end
+
+# A summary holds while the code it was read from does. The device's cache was
+# emptied whenever the world age moved, which in Julia 1.12 is any method defined
+# anywhere and even a new global at the REPL: the next scene re-inferred all 43
+# kernels of a Hikari render, two seconds of its first frame, for code that had
+# not changed. A redefinition reaches a summary through the `CodeInstance` it was
+# read from, whose world range Julia ends through the backedges of every caller.
+module AccessHoldsCode
+    load_or_store(p::Ptr{Float32}) = unsafe_load(p)
+    kernel(p::Ptr{Float32}) = load_or_store(p)
+end
+
+@testset "reading access IR populates the compiler's source cache" begin
+    sig = Tuple{typeof(AccessHoldsCode.kernel), Ptr{Float32}}
+    interp = Base.Compiler.NativeInterpreter()
+    walk = M.Walk(interp, IdDict{Any,M.Summary}(), Base.IdSet{Any}(), 24, sig)
+    ir = M.irfor(walk, sig)
+    @test ir !== nothing
+    match = Base._which(sig; world = Base.Compiler.get_inference_world(interp))
+    mi = Base.Compiler.specialize_method(match)
+    ci = get(Base.Compiler.code_cache(interp), mi, nothing)
+    @test ci isa Core.CodeInstance
+    source = GPUCompiler.CompilerCaching.get_source(ci)
+    @test source isa Core.CodeInfo
+    stored = @atomic :monotonic ci.inferred
+    code = copy(source.code)
+    @test M.irfor(walk, sig) !== nothing
+    @test get(Base.Compiler.code_cache(interp), mi, nothing) === ci
+    @test (@atomic :monotonic ci.inferred) === stored
+    @test GPUCompiler.CompilerCaching.get_source(ci).code == code
+end
+
+@testset "an access summary holds until its own code changes" begin
+    cache = M.AccessCache()
+    sig = Tuple{typeof(AccessHoldsCode.kernel), Ptr{Float32}}
+    touches() = M.accessof(nothing, AccessHoldsCode.kernel, (Ptr{Float32},); cache)[2]
+    @test touches() == M.READ
+    held = cache.summaries[sig]
+    # Defining something the kernel does not call keeps the summary.
+    Core.eval(AccessHoldsCode, :(unrelated() = 1))
+    @test touches() == M.READ
+    @test cache.summaries[sig] === held
+    # Redefining what the kernel calls renews it.
+    Core.eval(AccessHoldsCode, :(load_or_store(p::Ptr{Float32}) = (unsafe_store!(p, 1f0); 0f0)))
+    @test touches() == M.WRITE
+    @test cache.summaries[sig] !== held
+end
+
+# An outlined table lookup leaves scalar provenance in its caller. Scalar LLVM
+# sqrt reads no memory; the original input load still has to be recorded.
+@noinline access_loaded_value(ptr::Ptr{Float32})=unsafe_load(ptr)
+@inline access_root(x::Float32)=Base.llvmcall(("""
+declare float @llvm.sqrt.f32(float)
+define float @entry(float %x) {
+  %r = call float @llvm.sqrt.f32(float %x)
+  ret float %r
+}
+""","entry"),Float32,Tuple{Float32},x)
+function access_read_root!(out::Ptr{Float32},input::Ptr{Float32})
+    unsafe_store!(out,access_root(access_loaded_value(input)))
+    nothing
+end
+
+@testset "scalar square root after an outlined load" begin
+    @test M.accessof(nothing, access_read_root!, (Ptr{Float32}, Ptr{Float32})) ==
+          [M.NOTOUCH, M.WRITE, M.READ]
 end

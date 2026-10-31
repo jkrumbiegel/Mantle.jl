@@ -76,7 +76,8 @@ compileresult(g, plan) = (
     dev = M.Device(TESTBACKEND)
     n = 1 << 16
     g = buildprobe(dev, n)
-    r = compileresult(g, M.Plan(g))
+    plan = M.Plan(g)
+    r = compileresult(g, plan)
 
     # 5 transients x 65536 Float32 = 1_310_720 B if nothing aliased. The placer
     # gets it to exactly two buffers, which is what `bench/chain.jl` predicts in
@@ -89,9 +90,9 @@ compileresult(g, plan) = (
     # scheduled ahead of everything that could read them.
     @test r.scheduled == ["updates", "chain1", "chain2", "chain3", "branch1", "branch2"]
 
-    # Every pass, including the two that share no data with anything — those are
-    # ALIASING barriers. If a refactor drops them the peak stays right and the
-    # picture goes wrong intermittently, which is the worst failure available.
+    # The two independent branches still need ALIASING barriers. A recorded
+    # entry dependency covers updates and chain1; those no longer need duplicate
+    # first-use barriers. The actual chain and alias hazards remain pinned.
     # Backend-aware, because a backend whose passes each commit their own command
     # buffer on one queue is ordered by commit order and may derive nothing —
     # `sync/backend.jl` asks exactly that of it, and reading the answer here rather
@@ -103,11 +104,14 @@ compileresult(g, plan) = (
     W = M.Storage{M.BufferKind, M.Access{false, true}}
     R = M.Storage{M.BufferKind, M.Access{true, false}}
     derives = M.needs_transition(M.syncbackend(dev), M.BufferKind(), W, R)
-    @test derives ? all(r.barriered) : !any(r.barriered)
+    expected = !derives ? falses(6) : M.ordered_entry(M.Compile(plan)) ?
+               Bool[false, false, true, true, true, true] : trues(6)
+    @test r.barriered == expected
 
     # Pass indices are 1-based over the schedule above, so the update pass at
     # position 1 shifts every transient's interval by one.
     @test r.intervals == [(2, 3), (3, 4), (4, 4), (5, 5), (6, 6)]
+    M.free!(plan)
 end
 
 # ── KNOWN GAP: nothing above guards `Dag` ─────────────────────────────────────
@@ -225,4 +229,67 @@ end
     # changes, and if they stopped being derived from use this would still come
     # back 524_288 like the aliased case.
     @test M.peakbytes(plan) == 1_310_720
+end
+
+@testset "alias handovers respect bytes, lifetimes and arenas" begin
+    dev = M.Device(TESTBACKEND)
+    g = M.Graph(dev)
+    ts = [M.Transient.Buffer(g, Float32, 8), M.Transient.Buffer(g, UInt16, 8),
+          M.Transient.Buffer(g, UInt8, 16), M.Transient.Buffer(g, Float32, 4),
+          M.Transient.Buffer(g, UInt8, 8), M.Transient.Buffer(g, UInt8, 8)]
+    for (t, (a, b)) in zip(ts, [(1, 2), (3, 4), (2, 3), (5, 6), (7, 8), (9, 10)])
+        t.first, t.last = a, b
+    end
+    c = compilectx(g)
+    a = M.analysis(c)
+    a.offsets = [0, 16, 16, 32, 20, 0]
+    a.parts = Any[:first, :first, :first, :first, :first, :second]
+    M.run!(M.Aliasing(), c)
+    # 2 reuses the top half of 1; 5 reuses bytes of 1, 2 and 3. The live
+    # overlap of 2 and 3, adjacent bytes of 4, and separate arena of 6 add none.
+    @test a.alias_begins == Dict(3 => [(2, 1)], 7 => [(5, 1), (5, 2), (5, 3)])
+end
+
+@testset "hazards depend on the wait set and destination" begin
+    R = M.Storage{M.BufferKind,M.ReadOnly}
+    W = M.Storage{M.BufferKind,M.WriteOnly}
+    RW = M.Storage{M.BufferKind,M.ReadWrite}
+    ts = [M.Transition(1, R, Type[R, W], RW),
+          M.Transition(2, W, Type[W, R], RW),
+          M.Transition(3, R, Type[R, W], R),
+          M.Transition(4, R, Type[R], RW)]
+    hazards = M.barrierhazards(ts)
+    @test length(hazards) == 3
+    @test count(h -> h[2] === RW && issetequal(h[1], [R, W]), hazards) == 1
+    @test any(h -> h[2] === R && issetequal(h[1], [R, W]), hazards)
+    @test any(h -> h[2] === RW && h[1] == [R], hazards)
+end
+
+@testset "partially overlapping views survive replanning" begin
+    dev = M.Device(TESTBACKEND)
+    g = M.Graph(dev)
+    src = M.Buffer(dev, Float32.(1:16))
+    out = M.Buffer(dev, fill(NaN32, 16))
+    tmp = M.Transient.Buffer(g, Float32, 16)
+    window(b, offset) = M.ResourceView{Float32,1,typeof(b)}(b, (8,), offset)
+    M.dispatch!(g, goldenscale!, (tmp, src, 2f0), 16)
+    M.dispatch!(g, goldenscale!, (window(out, 0), window(tmp, 0), 3f0), 8)
+    M.dispatch!(g, goldenscale!, (window(out, 8), window(tmp, 4), 4f0), 8)
+    try
+        # The first compile interns segments of the overlapping ranges; the
+        # second must find those same segments without changing their hazards.
+        for _ in 1:2
+            plan = M.Plan(g)
+            try
+                M.record!(plan)
+                M.run!(plan)
+                @test Array(out) == vcat(6f0 .* (1:8), 8f0 .* (5:12))
+            finally
+                M.free!(plan)
+            end
+        end
+    finally
+        M.free!(src)
+        M.free!(out)
+    end
 end

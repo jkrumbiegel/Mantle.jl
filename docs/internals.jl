@@ -130,7 +130,7 @@ abstract type Node end
 # plan's own copies (section 4), so a recompile never touches the nodes an older
 # plan still in flight uses.
 mutable struct CompiledNode
-    queue::Queue                    # schedule!: a channel, or HostSide() for a host node
+    queue::Union{QueueKind,HostSide}   # schedule!: a queue kind (the run picks the queue), or HostSide() for a host node
     preds::Vector{Node}             # dependencies!: direct predecessors only
     barrier::Barrier                # barriers!, image transitions included
     command::CompiledCommand        # compile!: CompiledDispatch / CompiledTrace / CompiledCopy / …
@@ -148,6 +148,7 @@ mutable struct KernelNode{K,A,R,W,O} <: Node  # dispatch!(location, kernel, args
     const group::Union{Nothing,Int,Tuple}   # requested workgroup dimensions, retained through compile
     const when::W                           # nothing, or a when! flag: indirect count / capacity predication (section 2)
     const origin::O                         # an Origin
+    const split::Bool                       # dispatch!(…; split = true): costs! may cut it into workgroup ranges
     compiled::Union{Nothing,CompiledNode}
 end
 mutable struct TraceNode{P,T,A,R,W,O} <: Node  # trace!(g, pipeline, accel, args, ndrange)
@@ -305,8 +306,8 @@ end
 # of that group; on a device it runs now (section 11). An operation's method
 # calls it and does not know which.
 dispatch!(l::Union{GraphDevice,Group}, kernel, args::Tuple, ndrange;
-          group = nothing, origin = Origin(kernel, args)) =
-    declare!(l, KernelNode(kernel, args, ndrange, group, nothing, origin, nothing))
+          group = nothing, origin = Origin(kernel, args), split = false) =
+    declare!(l, KernelNode(kernel, args, ndrange, group, nothing, origin, split, nothing))
 # The KA adapter
 # resolves the size fixed in k's type when no launch-time override is given;
 # compile consults config(dev, f) only if neither supplied a size.
@@ -520,7 +521,7 @@ when!(g::Graph, flag::Union{GPURef{Bool},MantleArray{Bool,1}}, kernel::Function,
     when!(g.location, flag, kernel, args, ndrange; kw...)
 when!(l::Union{GraphDevice,Group}, flag::Union{GPURef{Bool},MantleArray{Bool,1}}, kernel::Function, args::Tuple, ndrange;
       origin = Origin(kernel, args)) =
-    declare!(l, KernelNode(kernel, args, ndrange, nothing, flag, origin, nothing))   # named through the node, like its arguments
+    declare!(l, KernelNode(kernel, args, ndrange, nothing, flag, origin, false, nothing))   # named through the node, like its arguments
 # A draw's visibility is a store into its flag, never a new plan. The
 # mechanism repeat!'s loop head uses: on Vulkan/Metal a when! launch/draw
 # uses an indirect command/range whose count is multiplied by the flag
@@ -758,24 +759,59 @@ function kernel!(dev, f, types; group = nothing)
 end
 
 # ── costs!: estimated, never measured-then-re-recorded ──
-costs!(s) = foreach(p -> (p.compiled.cost = estimate(s.device, p)), s.nodes)
+# A launch runs whole. One that cannot finish within the job timeout is a
+# compile error, unless its caller opted in to cutting it: then, where it
+# exceeds the budget, it becomes workgroup ranges. The estimate is a lower
+# bound (the work at full throughput and bandwidth), so the error fires only
+# for a launch that cannot finish in time. jobtimeout = Inf checks nothing.
+function costs!(s)
+    budget, timeout = submissionbudget(caps(s.device)), caps(s.device).jobtimeout
+    for p in copy(s.nodes)
+        p.compiled.cost = estimate(s.device, p)
+        if cuttable(p) && p.compiled.cost > budget
+            cutranges!(s, p, budget)
+        elseif p.compiled.cost > timeout
+            throw(LaunchTooLong(p.origin, p.compiled.cost, timeout))
+        end
+    end
+end
+cuttable(p::KernelNode) = p.split               # a library candidate with `partition` is cut into its
+cuttable(p) = false                             #   tiles the same way (execution-contracts.md §3)
+# The launch becomes consecutive ranges of its workgroups along its last axis,
+# each estimated within the budget: one KernelNode per range, with the
+# launch's kernel, arguments, uses and origin and the range's `firstgroup`,
+# which the entry wrapper adds to the workgroup id, so the kernel sees the
+# full grid. The ranges take the launch's place in the order; submissions!
+# cuts between them as between any nodes.
+function cutranges!(s, p, budget)
+    groups = numgroups(p)                           # along the last axis of the ndrange
+    n = min(groups, ceil(Int, p.compiled.cost / budget))
+    replace!(s, p => [rangenode(p, r) for r in Iterators.partition(1:groups, cld(groups, n))])
+end
 estimate(dev, p) = estimate(caps(dev), p) * calibration(dev, p)
 estimate(c::Caps, p) = max(work(p) / c.throughput[eltype(p)], bytes(p) / c.bandwidth)
     # work: 2MNK for a mul!, else from KernelInfo and the ndrange (the capacity for a kernel-written length)
     # c.throughput, c.bandwidth: facts the device type reports (api.md, `caps` in 4.1)
     # calibration: from past profiled runs of this device, 1.0 without any
 
-# ── schedule!: order and queue per node ──
+# ── schedule!: order and queue kind per node ──
+# Compile decides the kind; the queue of that kind is picked at each run
+# (pickchannel, section 8). `s.main` is the kind most of the graph runs on:
+# Main() for a graph with graphics work, otherwise the compute-capable kind
+# with the most queues (Compute() on RADV: one Main queue, four Compute queues).
 function schedule!(s)
     s.order = toposort(s.dag)
-    foreach(p -> (p.compiled.queue = queuefor(s.device, p)), s.order)
+    s.main = any(hasgraphics, s.nodes) ? Main() : widestcompute(queuekinds(s.device))
+    foreach(p -> (p.compiled.queue = queuefor(s, p)), s.order)
 end
-queuefor(dev, ::HostNode) = HostSide()
-queuefor(dev, ::HeadNode) = channel(dev, Main())
-queuefor(dev, ::VideoDecodeNode) = channel(dev, VideoDecode())
-queuefor(dev, p::CopyNode) = queuefor(dev, p, independenthostcopy(p), caps(dev).transfer)
-queuefor(dev, p::CopyNode, ::Independent, ::HasTransfer) = channel(dev, Transfer())
-queuefor(dev, p::Node) = overlapgain(p) > caps(dev).crossqueuecost ? channel(dev, Compute()) : channel(dev, Main())
+queuefor(s, ::HostNode) = HostSide()
+queuefor(s, ::HeadNode) = s.main
+queuefor(s, ::VideoDecodeNode) = VideoDecode()
+queuefor(s, p::CopyNode) = queuefor(s, p, independenthostcopy(p), caps(s.device).transfer)
+queuefor(s, p::CopyNode, ::Independent, ::HasTransfer) = Transfer()
+queuefor(s, p::Node) = overlapgain(p) > caps(s.device).crossqueuecost ? othercompute(s.main) : s.main
+othercompute(::Main) = Compute()
+othercompute(::Compute) = Main()
 
 # ── hostcuts!: before liveness!, because it changes the order ──
 # Moves independent nodes across host nodes, merges adjacent host nodes, and
@@ -788,7 +824,7 @@ function hostcuts!(s)
     mergeadjacent!(s, HostNode)
     for h in hostnodes(s.order), (a, u) in devicearrayuses(h)
         c = insertcopy!(s, h, a, u) # a new node with its edges
-        compile!(s, c); c.compiled.cost = estimate(s.device, c); c.compiled.queue = queuefor(s.device, c)
+        compile!(s, c); c.compiled.cost = estimate(s.device, c); c.compiled.queue = queuefor(s, c)
     end
 end
 
@@ -872,25 +908,26 @@ function addnode!(s, c, p::Node)
     added!(c, p)
 end
 mustcut(c, p) = !c.segment.presents &&            # the present segment is not cut before its PresentNode
-    (c.segment.channel !== p.compiled.queue || c.time + p.compiled.cost > c.budget || writeswindow(p))
+    (c.segment.kind !== p.compiled.queue || c.time + p.compiled.cost > c.budget || writeswindow(p))
 added!(c, p::Node) = writeswindow(p) && (c.segment.presents = true)
 added!(c, p::PresentNode) = closesegment!(c)      # the present segment ends here; the next node opens a new one
 # The present segment is one submission on one queue: from the first node that
 # writes the swapchain image to the PresentNode. presentspan! runs after
-# hostcuts! (whose copies may land in the span): every node in the span goes
-# on the present channel; a BuildNode or HostNode in it that nothing in the
+# hostcuts! (whose copies may land in the span): every node in the span gets
+# the present kind (Main(); the run picks one of its queues that can present
+# to the window); a BuildNode or HostNode in it that nothing in the
 # span depends on, and that depends on nothing in it, moves before the span;
 # one that cannot move is a compile error (a per-image recording holds no
 # BuildRecording, and the image cannot wait across a host function).
 # A node moves out when it does not depend, directly or transitively, on the
 # first window write (judged per node in order, so a node depending only on
-# nodes that moved out moves too); everything else stays and goes on the
-# present channel.
+# nodes that moved out moves too); everything else stays and gets the
+# present kind.
 function presentspan!(s)
     span = presentspanof(s)                          # empty without a window
     w = first(span)
     for p in span[2:end]
-        dependson(s.dag, p, w) ? setqueue!(p, presentchannel(s)) : movebefore!(s, p, w)
+        dependson(s.dag, p, w) ? setqueue!(p, Main()) : movebefore!(s, p, w)
     end
     any(p -> notinpresent(p), presentspanof(s)) &&
         throw(ArgumentError("a build or host node between rendering into the window and presenting it"))
@@ -963,11 +1000,11 @@ function record!(pl::Plan)
     for stage in pl.stages, seg in stage.segments
         windowed(seg) && continue                    # a present or window-sized segment: recordwindows!, per generation
         seg.parts = Any[]
-        b = Builder(pl.device, seg.channel)          # command objects from the device's free list
+        b = Builder(pl.device, seg.kind)             # command objects of the kind, from the device's free list
         for p in seg.nodes
             b = emitpart!(b, seg, pl, p)             # the builder to continue in
         end
-        push!(seg.parts, Recording(finish(b), seg.channel))
+        push!(seg.parts, Recording(finish(b), seg.kind))
     end
 end
 # Record compiles nothing, allocates nothing, submits nothing, reads no mutable
@@ -986,8 +1023,8 @@ emitpart!(b, seg, pl, p::Node) = (emit!(b, pl, p); b)
 # the same builder verbs, and that a run records again only when a change
 # marked it (a new count, a MoveAccel; B.8). Its barrier is recorded with it.
 function emitpart!(b, seg, pl, p::BuildNode)
-    push!(seg.parts, Recording(finish(b), seg.channel), BuildRecording(p.structure, p.mode, deps(p), seg.channel))
-    return Builder(pl.device, seg.channel)
+    push!(seg.parts, Recording(finish(b), seg.kind), BuildRecording(p.structure, p.mode, deps(p), seg.kind))
+    return Builder(pl.device, seg.kind)
 end
 
 emit!(b, pl, p::KernelNode)  = emitdispatch!(b, p, p.compiled.command, deps(p))
@@ -1350,6 +1387,7 @@ mutable struct RunState
     image::Union{Nothing,Image,WindowChanged,Minimized}
     generation::Union{Nothing,Swapchain} # the swapchain generation this run's window-sized segments use
     waits::Vector{Token}                # other graphs' work found by earlier stages (section 8); later stages wait too
+    channels::Dict{QueueKind,SubmitChannel}   # the run's pick per queue kind, made before its first submission (section 8)
 end
 
 # Two flags. `running` (set at the start, cleared at the end) keeps
@@ -1511,6 +1549,9 @@ function submitstage!(pl, stage, recs, items, rs)
     rs.waits = latestperchannel(filter(!passed, [rs.waits; otherwaits(pl, stage, items)]))
     w = copy(rs.waits)
     stage === first(pl.stages) && append!(w, lastrun(pl))   # runs never overlap
+    # One queue per kind for the whole run, picked from its waits under its
+    # locks before its first submission (section 8); its later stages use them.
+    stage === first(pl.stages) && (rs.channels = pickchannels(pl, w))
     waits = Dict(seg => w for seg in stage.segments)
     # The first segment carries the pending changes of the inbox resources, in
     # front of its head node (resizing-and-raytracing.jl B.4), applied with
@@ -1524,23 +1565,24 @@ function submitstage!(pl, stage, recs, items, rs)
         present = presentof(rs.image, seg)
         parts = segparts(seg, rs)                     # the present segment: the acquired image's recording;
                                                       #   a window-sized one: rs.generation's; others: their own
+        ch = rs.channels[seg.kind]
         ownwaits = [waits[seg]; [s.token for s in seg.after]]
         # The parts' command buffers are taken only after the change prefix is
         # emitted (inside submitwith! for the first segment), so a marked
         # BuildRecording is recorded again with the builtcount the prefix's
         # Build just set (B.8).
         if k == 1
-            r = submitwith!(seg.channel, recs, rs.prepared, (), parts; self = pl, ownwaits, present,
+            r = submitwith!(ch, recs, rs.prepared, (), parts; self = pl, ownwaits, present,
                             restores = stage === first(pl.stages) && (@atomic pl.restore))
             done(r) || return r                       # Again or WaitFor
             seg.token, changed = r
         else
             touched(seg, changed) && push!(ownwaits, first(stage.segments).token)   # reads what the changes wrote
-            seg.token = submit!(seg.channel, map(p -> commandbuffer(p, ()), parts); waits = ownwaits, present)
+            seg.token = submit!(ch, map(p -> commandbuffer(p, ()), parts); waits = ownwaits, present)
         end
         # All publication below uses pre-reserved bookkeeping capacity.
         # Do this per accepted segment: a later preparation/native enqueue may fail.
-        pl.lastrun[channelstate(seg.channel)] = seg.token
+        pl.lastrun[channelstate(ch)] = seg.token
         foreach(p -> submitted!(p, seg.token), parts)
         foreach(r -> notifyreaders!(r, pl), namedwrites(seg))
         pendreaders_locked!(pl, writtenresources(seg))
@@ -1889,11 +1931,64 @@ Token(ch::SubmitChannel, value) = Token(channelstate(ch), ch, value)
 Base.:(==)(a::Token, b::Token) = a.state === b.state && a.value == b.value
 Base.hash(t::Token, h::UInt) = hash((objectid(t.state), t.value), h)
 passed(t::Token) = (checkhealthy(t.state.domain); passed(t.channel, t.value))    # device-type verb: passed(ch, value)
-waitfor(t::Token) = (checkhealthy(t.state.domain); waitfor(t.channel, t.value))  # device-type verb: waitfor(ch, value)
+# A wait gives up two job timeouts after the submission before `t` on its
+# channel passed: by then the watchdog has killed it, whether or not the driver
+# says so, and the device counts as lost. Earlier submissions get the same
+# deadline, each from its own predecessor; with jobtimeout = Inf nothing times out.
+function waitfor(t::Token)
+    checkhealthy(t.state.domain)
+    limit = 2 * caps(device(t.channel)).jobtimeout
+    for u in outstanding(t.channel, t)              # the channel's unpassed submissions up to and including t
+        waitfor(t.channel, u.value, limit) ||      # device-type verb: waitfor(ch, value, timeout) -> Bool
+            lost!(t.state.domain, t.channel)        # poisons the domain; throws DeviceLost
+    end
+end
+# DeviceLost lists the launches of each channel's last submissions (a short
+# ring kept at submit) with their estimates and the job timeout: drivers
+# report a watchdog kill late (RADV at the next submission), so the error
+# names candidates rather than one culprit.
 waitfor(ts) = foreach(waitfor, ts)               # a collection of tokens
 # A host wait is a driver call made with `@ccall gc_safe = true` (Julia 1.12,
 # base/c.jl:278), so a thread waiting on the GPU does not hold up a GC another
 # thread needs.
+
+# ── Queue choice: at submission, from what the submission waits on ──
+# Compile fixed each segment's queue kind (section 4); the queue of that kind
+# is picked when the work is submitted: once per run, under its locks before
+# its first submission (all its stages use the pick), and once per eager
+# submission, under its locks, before it records. Every pick is correct, since
+# every wait names its channel; the pick decides only overlap and how many
+# waits cross queues. No task, thread or "current" queue takes part: two tasks
+# running independent work land on different queues because the first
+# submission's queue is busy when the second one picks. Two picks at the same
+# instant may both see one queue idle and share it: that costs overlap, never
+# correctness.
+pickchannels(pl, waits) = Dict(k => pickchannel(pl.device, k, priority(pl), waits) for k in segmentkinds(pl))
+pickchannel(dev, need, priority, waits) = pickchannel(queuepolicy(dev), channels(dev, need, priority), waits)
+function pickchannel(::DefaultQueues, chs, waits)
+    i = findfirst(ch -> any(t -> t.state === channelstate(ch), waits), chs)
+    i === nothing || return chs[i]          # it waits there anyway: no wait crosses queues; a graph waits on its
+                                            #   previous run, so it stays on its queue
+    i = findfirst(isidle, chs)              # independent work: an idle queue, the main one first
+    i === nothing || return chs[i]
+    return argmin(outstanding, chs)         # else the least busy
+end
+pickchannel(p::SpreadQueues, chs, waits) = chs[mod1(Threads.atomic_add!(p.next, 1), length(chs))]
+struct DefaultQueues end
+struct SpreadQueues                         # the specification's: every submission on the next queue of its kind
+    next::Threads.Atomic{Int}
+end
+SpreadQueues() = SpreadQueues(Threads.Atomic{Int}(0))
+# channels(dev, need, priority): the queues that can run the work, main queue
+# first. `need` is a recording's QueueKind (a run: exactly that kind, since the
+# recording belongs to it) or what an eager submission's work needs, recorded
+# after the pick: ComputeWork() (Main and Compute queues), GraphicsWork() (Main
+# queues), CopyWork() (every queue). On a device with queue priorities, only
+# the queues of the priority's class. How many queues of each kind core
+# opens is core's policy, from queuekinds(dev). isidle(ch): every submission
+# on ch passed (`passed` on its `next`, non-blocking); outstanding(ch): the
+# submissions not yet passed. queuepolicy(dev) and queuepolicy!(dev, p): the
+# device's policy, a field of its core state (api.md 2.1).
 
 # ── Between graphs: through the resource, when it is written ──
 # No plan keeps a list of other plans. A resource's SyncState has `namers`:
@@ -2113,16 +2208,19 @@ end
 # WaitFor waits outside the locks first. `own(after)` records the
 # submitter's own commands once the steps of the pending changes are known:
 # after(st) is the storage an array has after them, so an eager call packs
-# the addresses its arguments will have. Returns the token.
-function submitapplying(own, uses; ch = channel(device(first(first(uses))), Main()),
+# the addresses its arguments will have. `own(ch, after)` gets the channel the
+# submission picked under the locks, from its waits (section 8), and records
+# for that channel's kind. Returns the token.
+function submitapplying(own, uses; work = ComputeWork(),
                         validate = Returns(true), transfer = nothing)   # uses: (resource, use) pairs
+    target = EagerQueue(device(first(first(uses))), work)
     while true
         prepared = Prepared()
         r = nothing
         try
             prepare!(prepared, uses)                  # storage, pages, capacity, command objects, restores
             r = lockresources(uses; transfer) do recs, x
-                submitwith!(ch, recs, prepared, expand(x, uses), OwnWork(own, validate))   # records eager accesses
+                submitwith!(target, recs, prepared, expand(x, uses), OwnWork(own, validate))   # records eager accesses
             end
         finally
             release!(prepared)                        # what no committed step took
@@ -2143,14 +2241,21 @@ needsdestination(_) = false
 validateown(parts::Vector, after) = true
 validateown(w::OwnWork, after) = w.validate(after)
 waitforruns(w::WaitForTransfers) = waitfortransfers(w) # outside all record locks
-recordown(parts::Vector, steps) = map(p -> commandbuffer(p, steps), parts)   # a run's recorded parts
-recordown(w::OwnWork, steps) = w.own(storageafter(steps))            # an eager call, a copy of its own
+recordown(parts::Vector, ch, steps) = map(p -> commandbuffer(p, steps), parts)   # a run's recorded parts
+recordown(w::OwnWork, ch, steps) = w.own(ch, storageafter(steps))            # an eager call, a copy of its own
+# An eager submission's queue: picked in submitwith!, under the locks, from
+# the waits; a run passes the channel it already picked (section 6).
+struct EagerQueue{W}
+    device::Device
+    work::W                                   # ComputeWork(), GraphicsWork() or CopyWork()
+end
+pick(e::EagerQueue, waits) = pickchannel(e.device, e.work, 0, waits)   # eager work has the default priority
+pick(ch::SubmitChannel, waits) = ch
 # A submission whose own work is a copy (a host read, an eviction copy): the
 # same path, the copy emitted by `emit(b, after)`.
-submitnow!(emit, uses; ch = channel(device(first(first(uses))), Main()),
-           validate = Returns(true), transfer = nothing) =
-    submitapplying(after -> (b = Builder(device(ch), ch); emit(b, after); [finish(b)]),
-                   uses; ch, validate, transfer)
+submitnow!(emit, uses; work = CopyWork(), validate = Returns(true), transfer = nothing) =
+    submitapplying((ch, after) -> (b = Builder(device(ch), queuekind(ch)); emit(b, after); [finish(b)]),
+                   uses; work, validate, transfer)
 
 # ══ 9. Memory: pool, kinds, arenas, release ═══════════════════════════════════
 
@@ -2262,12 +2367,13 @@ end
 # the frozen source directly: NEVER apply pending stores/resizes in this job.
 function copyeviction!(job::HostCopyJob)
     for chunk in chunks(job.snapshot, job.staging; limit = 8 << 20)
-        b = Builder(job.device, job.channel)
+        ch = pickchannel(job.device, CopyWork(), 0, job.writers)   # section 8
+        b = Builder(job.device, queuekind(ch))
         emitcopy!(b, nothing, copyof(chunk.source => job.staging), chunk.deps)
         native = finish(b)
         token = lockresources(((job.state, Read()),); transfer = job) do recs, x
             matchestransfer(job) || throw(ArgumentError("eviction snapshot lost"))
-            t = submit!(job.channel, [native]; eager = ((job.state, Read()),), waits = job.writers)
+            t = submit!(ch, [native]; eager = ((job.state, Read()),), waits = job.writers)
             remember!(job, t) # pre-reserved token/command bookkeeping
             t
         end
@@ -2584,18 +2690,21 @@ end
 # evicted one, are applied in front of the launch by the same submission
 # (submitapplying). A write to a read-only array throws first, as in a graph
 # (checkwritable, section 2).
-function dispatch!(dev::Device, kernel, args::Tuple, ndrange; origin = nothing)
+# As in a graph, the launch runs whole: an estimate past the job timeout throws
+# LaunchTooLong before anything is acquired, unless `split = true`, which
+# submits its workgroup ranges (costs!, section 4) as consecutive calls.
+function dispatch!(dev::Device, kernel, args::Tuple, ndrange; origin = nothing, split = false)
     checkwritable(kernel, args)                           # before anything is compiled or acquired
     k = kernel!(dev, kernel, argtypes(args))
-    ch = channel(dev, Main())
     packed = acquire!(pool(dev), Unified(), argumentbytes(k))   # fallible: before any lock
     token = nothing
     try
-        token = submitapplying(uses(k, args); ch) do after   # under the locks, after the pending changes' steps
+        token = submitapplying(uses(k, args); work = ComputeWork()) do ch, after   # under the locks, after the
+                                                                                   #   pending changes' steps
             foreach(usable, resources(args))         # freed through the creator's handle: throws, under the lock
             packarguments!(packed, k, args, after)   # each array's storage after the pending changes, its requested dims
             ext = launchextents(dev, k, resolve(ndrange, args))   # requested lengths; device lengths use indirect / capacity predication
-            b = Builder(dev, ch)
+            b = Builder(dev, queuekind(ch))         # ch: picked under the locks, from the waits (section 8)
             emitdispatch!(b, nothing, CompiledDispatch(k, ext, packed), Deps((), ()))
             [finish(b)]
         end
@@ -2801,7 +2910,7 @@ function withview(f, ::Type{CuArray}, a::MantleArray{T,N,CudaDevice}, stream) wh
                 prepare!(prepared, ((st, Write()),))     # storage the pending changes and a restore need
                 r = lockresources(((st, Write()),)) do recs, x   # the naming plans' sync locks, then st's
                     usable(a)                            # freed through the creator's handle: throws, under the lock
-                    s = needsapplying(st) ? submitwith!(channel(device(a), Main()), recs, prepared, (), OwnWork(after -> [])) :
+                    s = needsapplying(st) ? submitwith!(EagerQueue(device(a), CopyWork()), recs, prepared, (), OwnWork((ch, after) -> [])) :
                                             nothing      # nothing pending, not evicted: no submission
                     s === nothing || done(s) || return s # Again or WaitFor: nothing submitted
                     ready = s === nothing ? Token[] : [first(s)]

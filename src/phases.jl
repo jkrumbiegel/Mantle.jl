@@ -150,6 +150,14 @@ struct Dag <: Phase end
 function run!(::Dag, c)
     ps = passes(c)
     a = analysis(c)
+    if policy(c) isa InOrder
+        # Declaration order is already a topological order: all graph hazards
+        # point from an earlier declaration to a later one. A chain represents
+        # that total order without materializing its quadratic transitive closure.
+        # Barriers still use the complete per-resource usages, not these edges.
+        a.deps=[i==1 ? Int[] : [i-1] for i in eachindex(ps)]
+        return c
+    end
     a.deps = [Int[] for _ in ps]
     # Earlier passes per `overlapgroup`: all that touched it, and those that
     # wrote it. A read depends on earlier writers, a write on every earlier pass,
@@ -193,6 +201,16 @@ struct Compact <: Policy end
 dependencies forced by shared memory. The default."""
 struct Overlap <: Policy end
 
+"""Keep declaration order with linear-size scheduling metadata. Resource barriers
+and transient liveness/aliasing remain unchanged; no dependency-based reordering
+is attempted. Useful for large, already ordered iterative compute graphs."""
+struct InOrder <: Policy end
+
+# The same global memory dependency covers prior accesses to every buffer, not
+# just the resource whose hazard caused it. Preserve exact usage keys rather
+# than guessing that a read-only execution dependency also flushes writes.
+replay_hazard_key(t::Transition) = (Tuple(sort(t.waits; by = string)), t.to)
+
 """Bit offset of each objective in the packed score; a policy is a choice of offsets."""
 memory_shift(::Compact) = 16
 memory_shift(::Overlap) = 0
@@ -210,6 +228,14 @@ function run!(::Schedule, c)
     n = length(ps)
     n == 0 && return c
 
+    if policy(c) isa InOrder
+        # repeat! bodies are declared contiguously; validate that rather than
+        # expanding loop dependencies for a schedule that will not reorder them.
+        loopspans(ps)
+        analysis(c).order=collect(1:n)
+        return c
+    end
+
     deps = loopdeps(ps, analysis(c).deps)
     remaining = [length(d) for d in deps]
     dependents = [Int[] for _ in 1:n]
@@ -219,9 +245,9 @@ function run!(::Schedule, c)
 
     # Passes touching each resource, so its last use is known. Counting usages
     # would double-count a pass that binds a resource twice and hide the last use.
-    ids(p) = unique(first(u) for u in usages(p))
+    ids = [unique(first(u) for u in usages(p)) for p in ps]
     touches = Dict{Int,Int}()
-    for p in ps, id in ids(p)
+    for resources in ids, id in resources
         touches[id] = get(touches, id, 0) + 1
     end
     seen = Dict{Int,Int}()
@@ -231,7 +257,7 @@ function run!(::Schedule, c)
     end
 
     maxalloc = max(1, maximum(eachindex(ps); init = 0) do i
-        sum(id -> get(bytesof, id, 0), ids(ps[i]); init = 0)
+        sum(id -> get(bytesof, id, 0), ids[i]; init = 0)
     end)
     mshift = memory_shift(policy(c))
     oshift = order_shift(policy(c))
@@ -241,7 +267,11 @@ function run!(::Schedule, c)
     # its passes are candidates until the last. `left` counts each loop's remainder.
     left = IdDict{Any,Int}()
     for p in ps
-        p.loop === nothing || (left[p.loop] = get(left, p.loop, 0) + 1)
+        loop = p.loop
+        while loop !== nothing
+            left[loop] = get(left, loop, 0) + 1
+            loop = loop.parent
+        end
     end
     inloop = nothing
 
@@ -249,10 +279,14 @@ function run!(::Schedule, c)
         best, bestscore = 0, -1
         for k in eachindex(ready)
             i = ready[k]
-            inloop === nothing || ps[i].loop === inloop || continue
+            inloop === nothing || withinloop(ps[i].loop, inloop) || continue
+            ord = clamp(n - i, 0, 0xffff)
+            # Under Overlap, declaration order occupies the high bits. A
+            # candidate already behind there cannot win on memory.
+            oshift > mshift && ord < (bestscore >> oshift) && continue
             alloc = 0
             freed = 0
-            for id in ids(ps[i])
+            for id in ids[i]
                 b = get(bytesof, id, 0)
                 b == 0 && continue
                 get(seen, id, 0) == 0 && (alloc += b)
@@ -265,7 +299,6 @@ function run!(::Schedule, c)
                   clamp((SCORE_MAX * freed) ÷ maxalloc, 0, SCORE_MAX)
             # Clamped because the fields are OR'd: a term spilling its 16 bits
             # corrupts the one above it.
-            ord = clamp(n - i, 0, 0xffff)                # earlier declaration scores higher
             score = (mem << mshift) | (ord << oshift)
             if score > bestscore
                 best, bestscore = k, score
@@ -276,12 +309,16 @@ function run!(::Schedule, c)
         i = ready[best]
         deleteat!(ready, best)
         push!(order, i)
-        if ps[i].loop !== nothing
-            l = ps[i].loop
-            left[l] -= 1
-            inloop = left[l] == 0 ? nothing : l
+        loop = ps[i].loop
+        while loop !== nothing
+            left[loop] -= 1
+            loop = loop.parent
         end
-        for id in ids(ps[i])
+        inloop = ps[i].loop
+        while inloop !== nothing && left[inloop] == 0
+            inloop = inloop.parent
+        end
+        for id in ids[i]
             seen[id] = get(seen, id, 0) + 1
         end
         for j in dependents[i]
@@ -308,7 +345,11 @@ function loopdeps(ps, deps)
     deps = [copy(d) for d in deps]
     members = IdDict{Any,Vector{Int}}()
     for (i, p) in enumerate(ps)
-        p.loop === nothing || push!(get!(members, p.loop, Int[]), i)
+        loop = p.loop
+        while loop !== nothing
+            push!(get!(members, loop, Int[]), i)
+            loop = loop.parent
+        end
     end
     for (_, ms) in members
         inside = Set(ms)
@@ -329,23 +370,22 @@ The loops among scheduled `passes`, as the contiguous range each body occupies.
 Throws if a body is not contiguous.
 """
 function loopspans(ps)
-    out = Tuple{UnitRange{Int},Loop}[]
-    i = 1
-    while i <= length(ps)
-        l = ps[i].loop
-        if l === nothing
-            i += 1
-            continue
+    members = IdDict{Loop,Vector{Int}}()
+    for (i, p) in enumerate(ps)
+        loop = p.loop
+        while loop !== nothing
+            push!(get!(members, loop, Int[]), i)
+            loop = loop.parent
         end
-        j = i
-        while j < length(ps) && ps[j + 1].loop === l
-            j += 1
-        end
-        any(x -> x[2] === l, out) && error(
-            "scheduling split the body of a loop; it has to be one run of passes")
-        push!(out, (i:j, l))
-        i = j + 1
     end
+    out = Tuple{UnitRange{Int},Loop}[]
+    for (loop, indices) in members
+        range = first(indices):last(indices)
+        length(indices) == length(range) || error(
+            "scheduling split the body of a loop; it has to be one run of passes")
+        push!(out, (range, loop))
+    end
+    sort!(out; by=x -> (first(x[1]), -length(x[1])))
     return out
 end
 
@@ -360,7 +400,7 @@ function transientfor(c, byid, id)
     t === nothing || return t
     r = get(c.graph.ids.by_id, id, nothing)
     r isa BufferRange || return nothing
-    return get(byid, get(c.graph.ids.ids, r.parent, 0), nothing)
+    return get(byid, get(c.graph.ids, r.parent, 0), nothing)
 end
 
 """Intervals come from the passes that use each transient, in scheduled order. With
@@ -509,6 +549,11 @@ one, whose first write would otherwise race the old tenant's last access."""
 function run!(::Aliasing, c)
     a = analysis(c)
     ts = transients(c)
+    # The resource vector is heterogeneous. Read its metadata once, outside the
+    # pairwise walk, so every overlap check is integer arithmetic.
+    starts = Int[t.first for t in ts]
+    stops = Int[t.last for t in ts]
+    ends = Int[a.offsets[i] + nbytes(ts[i]) for i in eachindex(ts)]
     # Per allocation, sorted by offset: a transient's bytes meet only those that
     # start inside it. Offsets in different allocations (another arena, or another
     # part `Place` spilled) never overlap.
@@ -522,9 +567,13 @@ function run!(::Aliasing, c)
         for (p, i) in enumerate(idx)
             for q in (p + 1):length(idx)
                 j = idx[q]
-                a.offsets[j] < a.offsets[i] + nbytes(ts[i]) || break
-                aliasbegin!(a, ts, i, j)
-                aliasbegin!(a, ts, j, i)
+                a.offsets[j] < ends[i] || break
+                a.offsets[i] < ends[j] || continue
+                if stops[j] < starts[i]
+                    push!(get!(Vector{Tuple{Int,Int}}, a.alias_begins, starts[i]), (i, j))
+                elseif stops[i] < starts[j]
+                    push!(get!(Vector{Tuple{Int,Int}}, a.alias_begins, starts[j]), (j, i))
+                end
             end
         end
     end
@@ -533,18 +582,31 @@ function run!(::Aliasing, c)
     return c
 end
 
-"""Transient `i` begins where `j`'s bytes were, after `j` is dead: a handover."""
-function aliasbegin!(a, ts, i::Int, j::Int)
-    y, x = ts[i], ts[j]
-    x.last < y.first || return nothing
-    a.offsets[i] < a.offsets[j] + nbytes(x) && a.offsets[j] < a.offsets[i] + nbytes(y) ||
-        return nothing
-    push!(get!(() -> Tuple{Int,Int}[], a.alias_begins, y.first), (i, j))
-    return nothing
-end
-
 """Transitions per pass, and which of them still need a barrier emitted."""
 struct Barriers <: Phase end
+
+# A dispatch's arguments are simultaneous accesses, not a sequence of GPU
+# commands. In particular `(out, (out,))` declares write and read separately.
+# Advancing state through those two entries used to lose the write before the
+# following pass. Join storage directions after expanding overlapping ranges.
+join_pass_storage(::Type,::Type)=nothing
+join_pass_storage(::Type{Storage{K,A}},::Type{Storage{K,B}}) where {K,A,B} =
+    Storage{K,Access{reads(A)||reads(B),writes(A)||writes(B)}}
+
+function barrier_pass_usages(p,segments_of)
+    out=Pair{Int,Type}[]
+    last=Dict{Int,Int}()
+    for (id,U) in p.usages,sid in segments_of(id)
+        at=get(last,sid,0)
+        merged=at==0 ? nothing : join_pass_storage(out[at].second,U)
+        if merged===nothing
+            push!(out,sid=>U);last[sid]=length(out)
+        else
+            out[at]=sid=>merged
+        end
+    end
+    out
+end
 
 """Resolve and build every pipeline a draw needs, once."""
 struct Pipelines <: Phase end
@@ -562,7 +624,11 @@ through the device's [`syncbackend`](@ref); `passbarriers` lowers the result."""
 function run!(::Barriers, c)
     g = c.graph
     be = syncbackend(g.dev)
+    replay=ordered_entry(c)
     states = Dict{Int,ResourceState}()
+    coalesce=replay&&global_buffer_barriers(be)
+    visible=Dict{Any,Int}()
+    lasttouch=Dict{Int,Int}()
 
     # A resource starts in the state of its last usage in this schedule: frame
     # N+1's first use follows frame N's last and may overlap it in flight. Seeding
@@ -573,22 +639,27 @@ function run!(::Barriers, c)
     # covers, a whole-resource usage for all of them.
     slices = sliceindex(g)
     segs = Dict{Int,Vector{Int}}()
-    let byparent = Dict{Int,Vector{UnitRange{Int}}}()
-        for ((pid, r), _) in g.views
-            push!(get!(byparent, pid, UnitRange{Int}[]), r)
+    let byparent = Dict{Int,Vector{Tuple{UnitRange{Int},Int}}}()
+        for ((pid, r), v) in g.views
+            push!(get!(Vector{Tuple{UnitRange{Int},Int}}, byparent, pid), (r, resourceid(g, v)))
         end
-        for (pid, ranges) in byparent
+        for (pid, slices) in byparent
+            ranges = first.(slices)
+            # Hashing a UnitRange visits its elements. Most segments are views
+            # already interned by the graph; find them by their endpoints.
+            existing = Dict((first(r), last(r)) => id for (r, id) in slices)
             parent = g.ids.by_id[pid]
             n = length(parent)
             cuts = sort!(unique!(vcat([1, n + 1], first.(ranges), last.(ranges) .+ 1)))
             spans = [cuts[k]:(cuts[k + 1] - 1) for k in 1:(length(cuts) - 1)]
             filter!(!isempty, spans)
             ids = map(spans) do s
-                resourceid(g, get!(() -> BufferRange(parent, s), g.views, (pid, s)))
+                get!(existing, (first(s), last(s))) do
+                    resourceid(g, get!(() -> BufferRange(parent, s), g.views, (pid, s)))
+                end
             end
             segs[pid] = ids                      # the whole buffer is every segment
-            for r in ranges
-                sid = resourceid(g, g.views[(pid, r)])
+            for (r, sid) in slices
                 segs[sid] = [ids[k] for (k, s) in enumerate(spans) if first(s) >= first(r) &&
                                                                       last(s) <= last(r)]
             end
@@ -596,22 +667,33 @@ function run!(::Barriers, c)
     end
     segments_of(id) = get(segs, id, (id,))
 
+    passes=ordered(c)
+    usages=[barrier_pass_usages(p,segments_of) for p in passes]
     final = Dict{Int,Type}()
-    for p in ordered(c), (id, U) in p.usages, sid in segments_of(id)
+    for pu in usages, (sid,U) in pu
         final[sid] = U
     end
 
-    # A replayed plan starts each segment where the previous run left it.
-    state(id) = get!(() -> ResourceState(resourcekind(g.ids.by_id[id]), final[id]), states, id)
+    # A replayed plan starts each segment where the previous run left it,
+    # unless the recording's full entry dependency has already ordered that use.
+    state(id) = get!(states,id) do
+        kind=resourcekind(g.ids.by_id[id])
+        replay&&kind isa BufferKind ? ResourceState(kind) : ResourceState(kind,final[id])
+    end
 
-    for (i, p) in enumerate(ordered(c))
+    for (i, p) in enumerate(passes)
         pre = Transition[]
-        for (id, U) in p.usages, sid in segments_of(id)
+        alias_last=Dict{Int,Int}()
+        for (sid,U) in usages[i]
+            # A recorded update pass emits no stores: they are submitted in
+            # front, then covered by the recording's full head dependency.
+            replay&&p.kind===:update&&resourcekind(g.ids.by_id[sid]) isa BufferKind&&continue
             transition!(pre, be, sid, state(sid), U)
         end
 
-        # Nothing is coalesced across resources: a buffer barrier orders only its
-        # buffer and a layout change is per image. `pre` is already minimal.
+        # The portable answer is per-resource. Native GLOBAL
+        # buffer dependencies can coalesce covered hazards below; images still
+        # require their own layout transitions.
         needed = pre
 
         # The aliasing handover, which `transition!` cannot see because the two
@@ -630,9 +712,39 @@ function run!(::Barriers, c)
             end
             isempty(waits) && continue
             push!(needed, Transition(0, first(waits), waits, to))
+            if coalesce
+                alias_last[length(needed)]=maximum((get(lasttouch,sid,0)
+                    for (a,o) in handovers if a==newi
+                    for sid in segments_of(resourceid(g,c.graph.transients[o])));init=0)
+            end
+        end
+
+        if coalesce
+            kept=Transition[]
+            for (j,t) in enumerate(needed)
+                # Image barriers still carry per-image layout/state. Only
+                # buffers and arena-memory handovers have global cache scope.
+                buffer=t.resource==0||resourcekind(g.ids.by_id[t.resource]) isa BufferKind
+                source=t.resource==0 ? alias_last[j] : get(lasttouch,t.resource,0)
+                if !buffer||source>get(visible,replay_hazard_key(t),0)
+                    push!(kept,t)
+                end
+            end
+            # Barriers precede this pass, so they cover accesses through i-1,
+            # not the writes the pass itself is about to issue.
+            for t in kept
+                (t.resource==0||resourcekind(g.ids.by_id[t.resource]) isa BufferKind)||continue
+                visible[replay_hazard_key(t)]=i-1
+            end
+            needed=kept
         end
 
         c.prepass[p] = needed
+        if coalesce
+            for (sid,_) in usages[i]
+                lasttouch[sid]=i
+            end
+        end
     end
     c
 end

@@ -19,13 +19,6 @@ function intrinsic_usage(::MetalAPI, name::Symbol)
         occursin(".store.", s) && return WRITE
         return ATOMIC
     end
-    s == "__metal_linked_closest" && return READ
-    s == "__metal_linked_any" && return READ
-    # Procedural trace calls read acceleration/candidate data through opaque intrinsics.
-    s == "__metal_linked_closest_proc" && return READ
-    s == "__metal_linked_any_proc" && return READ
-    # The candidate itself, when a kernel happens to name it.
-    startswith(s, PROCEDURAL_CANDIDATE_PREFIX) && return READ
     # Mesh-stage outputs write through the stage-owned leading object argument.
     (s == "air.set_position_mesh" || s == "air.set_index_mesh" ||
      s == "air.set_primitive_count_mesh" ||
@@ -54,13 +47,14 @@ Mantle.devicebuffertype(::MetalDevice, ::Type{T}, N::Int) where {T} =
     Metal.MtlDeviceArray{T,N,Metal.AS.Device}
 
 Mantle.isdevicearray(::Metal.MtlArray) = true
+Mantle.resource_identity(a::Metal.MtlArray)=a.data.rc
 
 # Include derived-array offsets when choosing aligned wide loads.
 Mantle.basealignment(a::Metal.MtlArray) =
     Mantle.powalign(UInt64(a.data[].buffer.gpuAddress) + UInt64(a.offset))
 
 """Whether Metal's native SIMD-group GEMM covers these element types."""
-Mantle.native_gemm_available(::Union{MetalDevice,Metal.MetalBackend},
+Mantle.native_gemm_available(::MetalDevice,
                              ::Type{A}, ::Type{B}, ::Type{C}) where {A,B,C} =
     Metal.gemm_simd_eltype(A, B, C)
 

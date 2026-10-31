@@ -54,7 +54,7 @@ device parameter: what a function does to its arguments is not a driver fact. A
 declared callable must not close over device memory; its own entry gets `NOTOUCH`.
 """
 argument_usage(@nospecialize(F::Type), @nospecialize(A::Type)) = nothing
-argument_usage(@nospecialize(f), args::Tuple) =
+argument_usage(@nospecialize(f), @nospecialize(args::Tuple)) =
     argument_usage(Core.Typeof(f), Base.to_tuple_type(map(Core.Typeof, args)))
 
 """
@@ -82,7 +82,7 @@ What `f` does to each of `args` when dispatched on `device`: the declaration
 read+write: that answer is indistinguishable from a proof and would silently cost
 a barrier per pass.
 """
-function argument_usage(dev, @nospecialize(f), args::Tuple, ndrange, group)
+function argument_usage(dev, @nospecialize(f), @nospecialize(args::Tuple), ndrange, group)
     declared = argument_usage(f, args)
     declared === nothing || return Touch[declared...]
     ndrange === nothing && throw(UndeclaredCall(f, args))
@@ -224,18 +224,55 @@ pack(arg::Int, elem::Int) = (arg << ELEMBITS) | (0 <= elem <= MAXELEM ? elem : 0
 unpack(r::Int) = (r >> ELEMBITS, r & MAXELEM)
 
 """
+What a signature does to its arguments, and how long that holds: while `ci`, the
+`CodeInstance` its IR was inferred as, is valid. Julia ends a `CodeInstance`'s
+world range when a method its code depended on is redefined, through backedges
+and so transitively for every caller, which makes a summary stale exactly when
+the code it was read from changes. A declared signature (`declaredsignature`), or
+one with no `CodeInstance`, holds in the world it was worked out in.
+"""
+struct Summary
+    touches::Vector{Touch}
+    ci::Union{Nothing,Core.CodeInstance}
+    world::UInt
+    dependencies::Vector{Core.CodeInstance}
+end
+Summary(touches, ci, world) = Summary(touches, ci, world, Core.CodeInstance[])
+
+holds(ci::Core.CodeInstance, world::UInt) =
+    (@atomic :monotonic ci.max_world) >= world &&
+    !iszero(ci.def.def.dispatch_status & Base.StaticData.METHOD_SIG_LATEST_WHICH)
+holds(s::Summary, world::UInt) =
+    (s.ci === nothing ? s.world == world : holds(s.ci, world)) &&
+    all(ci -> holds(ci, world), s.dependencies)
+
+"""
 State one `accessof` shares across the method instances it walks. `summaries`
 caches each callee's result per signature; `active` detects recursion, which is
 refused.
 """
 struct Walk{I}
     interp::I
-    summaries::IdDict{Any,Vector{Touch}}
+    summaries::IdDict{Any,Summary}
     active::Base.IdSet{Any}
     maxdepth::Int
     # The signature `accessof` was asked about, so a refusal in a callee names the
     # dispatched kernel.
     top::Any
+    # Access analysis follows non-inlined callees too. Their bodies may change without
+    # invalidating the caller's inferred return type, so retain those dependencies.
+    dependencies::Vector{Base.IdSet{Core.CodeInstance}}
+end
+Walk(interp, summaries, active, maxdepth, top) =
+    Walk(interp, summaries, active, maxdepth, top, Base.IdSet{Core.CodeInstance}[])
+
+function summarytouches(w::Walk, summary::Summary)
+    if !isempty(w.dependencies)
+        deps = last(w.dependencies)
+        summary.ci === nothing || push!(deps, summary.ci)
+        union!(deps, summary.dependencies)
+    end
+    return summary.touches
 end
 
 """
@@ -321,24 +358,17 @@ end
 """
 Summaries one device has worked out, reused across every graph it builds; a
 wavefront stage is ten thousand statements to infer. Keyed by signature and held
-per device, since answers come from its interpreter. Emptied when the world age
-moves, because a redefined method changes answers.
+per device, since answers come from its interpreter. Each holds while the code it
+was read from does ([`Summary`](@ref)), so defining an unrelated method costs
+nothing.
 """
-mutable struct AccessCache
-    world::UInt64
-    summaries::IdDict{Any,Vector{Touch}}
+struct AccessCache
+    summaries::IdDict{Any,Summary}
 end
-AccessCache() = AccessCache(Base.get_world_counter(), IdDict{Any,Vector{Touch}}())
+AccessCache() = AccessCache(IdDict{Any,Summary}())
 
-function summaries!(c::AccessCache)
-    w = Base.get_world_counter()
-    if c.world != w
-        empty!(c.summaries)
-        c.world = w
-    end
-    return c.summaries
-end
-summaries!(::Nothing) = IdDict{Any,Vector{Touch}}()
+summaries!(c::AccessCache) = c.summaries
+summaries!(::Nothing) = IdDict{Any,Summary}()
 
 """
     accesscache(device) -> AccessCache
@@ -373,23 +403,60 @@ signature has unreachable IR with no store, and "no store" must never be a guess
 because it removes a barrier.
 """
 function irfor(w::Walk, @nospecialize(sig))
-    irs = w.interp === nothing ? Base.code_ircode_by_type(sig) :
-                                 Base.code_ircode_by_type(sig; interp = w.interp)
+    interp = w.interp === nothing ? Base.Compiler.NativeInterpreter() : w.interp
+    match = Base._which(sig; method_table = Base.Compiler.method_table(interp),
+                        world = Base.Compiler.get_inference_world(interp), raise = false)
+    match === nothing && return nothing
+    mi = Base.Compiler.specialize_method(match)
+    # code_ircode_by_type infers its root with cache_mode=:no. Read the source that
+    # codegen caches instead: the walk populates it for the compile, or reuses it
+    # when the kernel was compiled first. inflate_ir copies it before conversion.
+    ci = GPUCompiler.drive_inference!(interp, mi)
+    ci === nothing && return nothing
+    ci.rettype === Union{} && return nothing
+    src = GPUCompiler.CompilerCaching.get_source(ci)
+    src === nothing && return nothing
+    return Base.Compiler.inflate_ir(src, mi)
+end
+
+"Accept actual inferred IR only; reflection can return Method => Any on failure."
+function inferred_access_ir(irs)
     length(irs) == 1 || return nothing
     ir, rt = irs[1]
+    # Julia 1.12's reflection fallback is a Method, not IRCode. Treating it
+    # as IR raises FieldError in argmap and cannot establish resource access.
+    # `nothing` preserves signaturetouches/accessof's existing refusal path;
+    # in particular it is NOT an empty/no-touch proof.
+    ir isa Core.Compiler.IRCode || return nothing
     rt === Union{} && return nothing
     return ir
 end
 
+"""
+The `CodeInstance` `sig` has in the walk's interpreter's cache, populated by
+[`irfor`](@ref), or `nothing` when no single method applies.
+"""
+function codeinstance(w::Walk, @nospecialize(sig))
+    interp = w.interp === nothing ? Base.Compiler.NativeInterpreter() : w.interp
+    match = Base._which(sig; method_table = Base.Compiler.method_table(interp),
+                        world = Base.get_world_counter(), raise = false)
+    match === nothing && return nothing
+    ci = Base.Compiler.typeinf_ext(interp, Base.Compiler.specialize_method(match),
+                                   Base.Compiler.SOURCE_MODE_NOT_REQUIRED)
+    return ci isa Core.CodeInstance ? ci : nothing
+end
+
 """Per-argument `Touch` for a whole signature, or `nothing` if it cannot be seen."""
 function signaturetouches(w::Walk, @nospecialize(sig), depth::Int)
-    haskey(w.summaries, sig) && return w.summaries[sig]
+    world = Base.get_world_counter()
+    known = get(w.summaries, sig, nothing)
+    known !== nothing && holds(known, world) && return summarytouches(w, known)
     # A declaration outranks the walk and is checked before the depth limit and the
     # recursion guard: a device intrinsic's body is an `llvmcall` naming a symbol
     # only its emitter understands. Cached like an inferred answer.
     declared = declaredsignature(sig)
     if declared !== nothing
-        w.summaries[sig] = declared
+        w.summaries[sig] = Summary(declared, nothing, world)
         return declared
     end
     depth > w.maxdepth && return nothing
@@ -398,13 +465,16 @@ function signaturetouches(w::Walk, @nospecialize(sig), depth::Int)
     ir = irfor(w, sig)
     ir === nothing && return nothing
     push!(w.active, sig)
-    try
+    push!(w.dependencies, Base.IdSet{Core.CodeInstance}())
+    summary = try
         touches = walkir(w, ir, argmap(ir, sig), depth)
-        w.summaries[sig] = touches
-        return touches
+        Summary(touches, codeinstance(w, sig), world, collect(last(w.dependencies)))
     finally
+        pop!(w.dependencies)
         delete!(w.active, sig)
     end
+    w.summaries[sig] = summary
+    return summarytouches(w, summary)
 end
 
 """
@@ -745,13 +815,42 @@ function calltaint!(w::Walk, ir, touches, st::State, am::ArgMap, i::Int,
     # unresolved.
     tt === Union{} && return Taint()
     for a in rest
-        refuse!(w, am, operandtaint(ir, st, a),
-                "a call to `$f` it has no summary for and could not resolve, " *
-                "which a device compiler rejects as a dynamic invocation",
-                Expr(:call, args...))
+        refuse!(w, am, operandtaint(ir, st, a), dynamiccall(ir, f), Expr(:call, args...))
     end
     return carries(tt) ? out : Taint()
 end
+
+"""
+Why a dynamic call is refused, naming its callee. An SSA callee is shown as the
+statement that produced it, and a module member that does not exist says so: a
+kernel calling `Atomix.atomic_max`, which Atomix does not define, was reported
+as a call to `%12`, which neither a reader nor a model handed the message as
+feedback can act on.
+"""
+function dynamiccall(ir, @nospecialize(f))
+    def = f isa Core.SSAValue ? ir.stmts[f.id][:stmt] : f
+    ref = modulemember(def)
+    if ref !== nothing && !isdefined(ref.mod, ref.name)
+        return "a call to `$(ref.mod).$(ref.name)`, which `$(ref.mod)` does not define, " *
+               "so the call stays dynamic and a device compiler rejects it"
+    end
+    callee = ref !== nothing ? "$(ref.mod).$(ref.name)" : f isa Core.SSAValue ? "$f = $def" : "$f"
+    return "a call to `$callee` it has no summary for and could not resolve, " *
+           "which a device compiler rejects as a dynamic invocation"
+end
+
+modulemember(@nospecialize(x)) = nothing
+modulemember(x::GlobalRef) = x
+# `getglobal(M, :name)`: what `M.name` becomes when the optimiser cannot resolve it.
+function modulemember(x::Expr)
+    Meta.isexpr(x, :call, 3) && opname(x.args[1]) === :getglobal || return nothing
+    mod, name = constmodule(x.args[2]), x.args[3]
+    mod isa Module && name isa QuoteNode && name.value isa Symbol || return nothing
+    return GlobalRef(mod, name.value)
+end
+# The module operand arrives as a value or as a reference to its binding.
+constmodule(@nospecialize(x)) = x
+constmodule(x::GlobalRef) = isdefined(x.mod, x.name) ? getglobal(x.mod, x.name) : nothing
 
 """
 A store `pointerset(ptr, value, index, align)`: ordered unless the slot was claimed.
@@ -774,6 +873,9 @@ define `intrinsic_usage(::Symbol)`: with two backends compiled (a Mac) that is o
 method defined twice, which precompilation refuses.
 """
 function intrinsic_usage(name::Symbol)
+    # An outlined lookup can pass scalar provenance from a captured table into
+    # sqrt. LLVM's scalar square root has no memory access, on every backend.
+    name in (Symbol("llvm.sqrt.f32"), Symbol("llvm.sqrt.f64")) && return NOTOUCH
     u = intrinsic_usage(VulkanAPI(), name)
     return u === nothing ? intrinsic_usage(MetalAPI(), name) : u
 end
@@ -913,9 +1015,9 @@ What `kernel` does to each of `args` when dispatched on `device`. The backend
 supplies the signature (interpreter, device-side argument types, leading kernel
 arguments); the walk, `accessof`, is shared.
 """
-function kerneltouches(dev, kernel, args::Tuple, ndrange, group)
+function kerneltouches(dev, kernel, @nospecialize(args::Tuple), ndrange, group)
     argT = map(a -> devicetype(dev, a), args)
-    if buildskernel(kernel, backend(dev))
+    if buildskernel(kernel, dev)
         interp, body, tt = kakernelaccesssignature(dev, kernel, argT, ndrange, group)
         return accessof(interp, body, tt; cache = accesscache(dev))[3:end]
     end
@@ -926,24 +1028,27 @@ function kerneltouches(dev, kernel, args::Tuple, ndrange, group)
     return accessof(interp, kernel, argT; cache = accesscache(dev))[2:end]
 end
 
-"""The interpreter a backend compiles a macro-free kernel through."""
+"""
+    kernelinterpreter(device, kernel, tt[, threads])
+
+The interpreter a backend compiles `kernel` through. A KA kernel's walk passes the
+`threads` per workgroup its launch was partitioned into, for a backend whose
+compiler folds the workgroup size; the default ignores it.
+"""
 function kernelinterpreter end
+kernelinterpreter(dev, kernel, tt, threads::Integer) = kernelinterpreter(dev, kernel, tt)
 
 """
     kakernelaccesssignature(device, kernel, argtypes, ndrange, group)
 
 Interpreter, body and signature of a retained KernelAbstractions kernel, built the
-way a KA launch builds its context. Backends override it only when their launch
-signature differs (Lava retains an `IterPlan`).
+way a dispatch's launch builds its context ([`launchshape`](@ref)).
 """
 function kakernelaccesssignature(dev, kernel, argT::Tuple, ndrange, group)
-    obj = kernelfor(kernel, group, backend(dev))
-    nd = dispatchrange(ndrange)
-    cg = callgroup(obj, group)
-    ndr, _, iterspace, _ = KA.launch_config(obj, nd, cg)
-    ctx = KA.mkcontext(obj, ndr, iterspace)
-    tt = (argtype(dev, ctx), argT...)
-    return kernelinterpreter(dev, obj.f, Tuple{tt...}), obj.f, tt
+    obj = kernelfor(kernel, group, dev)
+    s = launchshape(obj, dispatchrange(ndrange), callgroup(obj, group))
+    tt = (argtype(dev, s.ctx), argT...)
+    return kernelinterpreter(dev, obj.f, Tuple{tt...}, groupthreads(s)), obj.f, tt
 end
 
 """

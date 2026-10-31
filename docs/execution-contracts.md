@@ -229,14 +229,30 @@ HIP supports CUDA conditional nodes. Compile once against capacity; exceeding it
 recompiles. Device slot loads are part of the wrapper, not backend-specific
 consumer branches. The compile key includes this ABI and enabled feature set.
 
-A budget is an estimate, not a hard execution-time guarantee. Core splits
-repeat iterations and independently tileable candidates between submissions.
-A candidate exposes `partition` only when tiles preserve its declared effects
-and ordering. Reductions require an explicit combine, never arbitrary grid
-cuts. Unknown-time or indivisible nodes cannot be guaranteed watchdog-safe;
-report the node and choose a qualified alternative when available. No library
-name proves bounded execution. Qualify heavy DNN/LLM workloads on display GPUs;
-never promise universal timeout avoidance for arbitrary user kernels.
+A budget is an estimate, not a hard execution-time guarantee. Core cuts
+submissions between nodes and between repeat iterations, and cuts a library
+candidate into its tiles where its estimate exceeds the budget; a candidate
+exposes `partition` only when tiles preserve its declared effects and
+ordering, and reductions require an explicit combine, never arbitrary grid
+cuts. A plain launch is cut only when its caller passes `split = true`: then,
+where its estimate exceeds the budget, it runs as consecutive workgroup ranges
+in separate submissions, and the entry wrapper adds each range's first
+workgroup so the kernel sees the full grid. Core reshapes nothing else to fit
+a watchdog.
+
+Failing to fit is an explicit error. A launch whose estimate exceeds
+`jobtimeout` throws `LaunchTooLong(origin, estimate, timeout)` at compile; the
+roofline estimate is a lower bound, so this fires only for a launch that
+cannot finish in time. A lost device throws `DeviceLost`, which lists the
+launches of each channel's last submissions (core keeps the last few per
+channel) with their estimates and the timeout: the kill surfaces late (RADV
+reports it at the next submission), so the error names candidates, not one
+culprit. Core's `waitfor(::Token)` passes the native wait a timeout of twice
+`jobtimeout`, counted from the moment the submission before it on that channel
+passed; a wait that runs out poisons the failure domain and throws the same
+`DeviceLost`. No library name proves bounded execution. Qualify heavy DNN/LLM
+workloads on display GPUs; never promise universal timeout avoidance for
+arbitrary user kernels.
 
 ## 4. Presentation retirement
 
@@ -349,7 +365,7 @@ KernelInterface's capability tables.
 | `inlinestore`, `inlinealign` | Nonnegative Int byte limit, positive Int alignment. Zero limit selects upload-copy. |
 | `throughput`, `bandwidth`, `crossqueuecost` | Immutable type→operations/second record, positive bytes/second, nonnegative seconds. Add `costsource` = :measured/:driver/:estimate; zero throughput means ineligible, never division by zero. |
 | `transfer`, `displayattached` | Bool: useful transfer queue, watchdog/display risk. display means usable WSI and is independent of displayattached; headless use does not turn off a physical watchdog. queuekinds/openchannels carry family/index and command kinds. |
-| `jobtimeout` | Seconds or Inf when no bound is known; an unknown watchdog bound is not proof of unlimited execution. Core applies its documented conservative submission estimate. |
+| `jobtimeout` | Seconds or Inf when no bound is known; an unknown watchdog bound is not proof of unlimited execution. Core applies its documented conservative submission estimate. With Inf, no `LaunchTooLong` check and no host-wait timeout apply (§3). |
 | `devicekey`, `compilerkey`, `enabledfeatures` | Immutable native identity/architecture, compiler+ABI version key, sorted enabled feature tuple. Compilation requires equality of relevant keys; device type identity alone is insufficient. |
 
 Core owns dimension and byte-span validation before allocation, placement or
@@ -1004,3 +1020,23 @@ The public launch API does not expose source-cell addresses except lengthof.
 A backend must qualify the check against its compiler output rather than merely
 stamp every ordinary kernel with "no cell reads". THR-04 and KL-10 define the
 executable acceptance cases; debug checking is off on performance runs.
+
+## Graph-declared readback snapshots
+
+`Readback(array)` and `Readback(graph, array)` declare a snapshot at their graph
+position and return a one-shot future. The copy has an explicit source-read and
+destination-write dependency, so source liveness reaches the copy and later
+source writes follow it. Readback destinations do not alias transient storage.
+Vulkan's recorded copy includes a transfer-write to host-read visibility barrier;
+coherent host-cached staging is read only after the captured execution token.
+The shared-memory implementation uses a normal graph copy kernel.
+
+Each output has a reusable staging slot owned by its live plan. Each execution
+with requests publishes a snapshot carrying that run's token and a hold on the
+slot's Buffer. `fetch` waits for that token and makes an owning CPU array; no
+submission is made. Before replay overwrites a previous outstanding snapshot,
+core materializes it. `free!(plan)` remains nonblocking: it rejects unsubmitted
+requests and drops its slot hold, while submitted futures keep their storage
+until collection. Run failures reject requests rather than leaving waiters
+blocked. A moved native source binding is recompiled/recorded before replay;
+a changed logical shape is rejected by this fixed-shape implementation.

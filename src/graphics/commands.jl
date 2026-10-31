@@ -2,52 +2,6 @@
 # implemented by a backend.
 
 """
-    begin_pass!(emitter, color_views, color_images, extent; clear_color, depth_view, ...)
-
-Begin a render pass on `emitter`; must be matched by [`end_pass!`](@ref). A draw
-outside a pass is an error, since a driver that accepts one draws nothing and
-reports nothing.
-"""
-function begin_pass! end
-
-"""
-    end_pass!(emitter)
-
-End the render pass begun by [`begin_pass!`](@ref).
-"""
-function end_pass! end
-
-"""
-    draw_in_pass!(emitter, pipeline, count; instances = 1)
-
-Issue a non-indexed draw inside an open pass.
-"""
-function draw_in_pass! end
-
-"""
-    draw_indexed_in_pass!(emitter, pipeline, count; indices_buffer, instances = 1)
-
-Issue an indexed draw inside an open pass.
-"""
-function draw_indexed_in_pass! end
-
-"""
-    draw_indirect_in_pass!(emitter, pipeline, commands; first = 1, count = 1)
-
-Issue draws whose parameters the device reads from `commands`, as
-[`DrawIndirectCommand`](@ref) records, so a culling pass can set the vertex
-counts without a host round trip.
-"""
-function draw_indirect_in_pass! end
-
-"""
-    set_viewport!(emitter, x, y, width, height)
-
-Set the viewport rectangle for subsequent draws.
-"""
-function set_viewport! end
-
-"""
     present_frame!(device, window)
 
 Show what was drawn, ordered behind the frame's work: presenting an image the
@@ -70,11 +24,12 @@ function acquire_next_image! end
 """
     checkacquirable(acquirer)
 
-Refuse a second image while `acquirer`, the task holding the window's image, has
-not presented it; `nothing` is a window between frames. Compiling a kernel
-mid-frame yields, so a second task can arrive between acquire and present. On
-Vulkan its acquire would block forever in a foreign call; on Metal two frames
-would draw at once.
+Refuse a second image while `acquirer`, the task drawing the window's frame, has
+not presented it; `nothing` is a window between frames. Host waits yield
+([`hostwait`](@ref)) and so does compiling a kernel, so a second task can arrive
+anywhere between acquire and present, and two frames would draw into one window
+at once. A backend claims the window before its acquire blocks, so the claim
+covers the wait for the image too.
 """
 checkacquirable(::Nothing) = nothing
 function checkacquirable(acquirer::Task)
@@ -84,6 +39,22 @@ function checkacquirable(acquirer::Task)
     error("acquire_next_image!: this window already holds an image, acquired by " *
           who * ". A window is rendered by one task: pass it around, or hand it " *
           "over once the frame that owns it has been presented.")
+end
+
+"""
+    checkframeowner(acquirer, what)
+
+Refuse to `what` (resize, close) a window while another task draws a frame into
+it. That task yields in its waits, so this one can run mid-frame, and on Vulkan a
+worker thread may be inside `vkAcquireNextImageKHR` on the swapchain this would
+destroy. The task drawing the frame may: a stale swapchain is rebuilt from inside
+its acquire and present.
+"""
+checkframeowner(::Nothing, what) = nothing
+function checkframeowner(acquirer::Task, what)
+    acquirer === current_task() && return nothing
+    error("$what: another task ($acquirer) is drawing a frame into this window. A " *
+          "window is rendered by one task; stop its loop and wait for it, then $what.")
 end
 
 """
@@ -129,6 +100,8 @@ function readback_target(pl::Plan, t)
     rest = restingusage(pl, t)
     rest === nothing && throw(ArgumentError(
         "readback_target: the plan never uses this target, so it holds nothing to read"))
+    t.image === nothing && throw(ArgumentError(
+        "readback_target: this target holds no image; its plan was freed"))
     return readback_target(pl.graph.dev, t, rest)
 end
 
@@ -148,7 +121,7 @@ The destination of the last transition `plan` makes on `r`, in scheduled order:
 the layout `r` rests in between runs. `nothing` when the plan never touches `r`.
 """
 function restingusage(pl::Plan, r)
-    id = get(pl.graph.ids.ids, r, nothing)
+    id = get(pl.graph.ids, r, nothing)
     id === nothing && return nothing
     rest = nothing
     for pp in pl.passes, t in pp.pre
@@ -163,13 +136,8 @@ end
 Whether `backend` can rasterize: render passes, graphics pipelines, vertex and
 fragment stages. `false` by default so a backend opts in. Callers that can
 degrade ask; RayMakie takes its direct-readback path when it is `false`.
-
-The untyped default would answer `false` for a device nobody wrote a method for,
-so the `::Device` method routes to the device's backend. A backend may still
-define a more specific method for its device.
 """
 supports_graphics(backend) = false
-supports_graphics(dev::Device) = supports_graphics(backend(dev))
 
 """
     supports_geometry_stage(backend) -> Bool
@@ -183,10 +151,6 @@ as Metal's `compile_draw` does; [`supports_mesh_pipeline`](@ref) asks that.
 supports_geometry_stage(backend) = false
 @doc (@doc supports_geometry_stage) supports_tessellation(backend) = false
 
-# Route a device to its backend's answer; see `supports_graphics`.
-supports_geometry_stage(dev::Device) = supports_geometry_stage(backend(dev))
-supports_tessellation(dev::Device) = supports_tessellation(backend(dev))
-
 """
     supports_mesh_pipeline(backend) -> Bool
 
@@ -196,7 +160,6 @@ Whether this backend can run a [`MeshPipeline`](@ref) (Metal mesh pipelines,
 geometry body. `false` by default.
 """
 supports_mesh_pipeline(backend) = false
-supports_mesh_pipeline(dev::Device) = supports_mesh_pipeline(backend(dev))
 
 """
     use_bindings!(handle, compiled, bindings)
@@ -219,8 +182,10 @@ function use_bindings! end
 Compile a [`GraphicsPipeline`](@ref) for the attachments it draws into. Called
 once per draw at compile time, not per frame; a backend is expected to cache.
 
-`color_formats` are element types, as a `Transient.Image` is named.
-`vert_args`/`frag_args` are the resolved values, not their types, because a
+`color_formats` and `depth_format` are the attachments' native formats
+([`target_format`](@ref), [`depthformat`](@ref)), not element types, which lose
+the sRGB encoding a target may have. `vert_args`/`frag_args` are the resolved
+values, not their types, because a
 backend derives a stage's device signature by adapting each value as a launch
 would. `bindings` is the texture table from [`bind_textures`](@ref) or `nothing`;
 Vulkan builds the pipeline layout around its descriptor set layout, Metal ignores

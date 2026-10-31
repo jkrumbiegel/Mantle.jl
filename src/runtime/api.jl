@@ -8,7 +8,9 @@ A device owns its graphs, resources and submit channels, and is a
 KernelAbstractions backend. Device(api) returns its cached default; select
 creates an independent device without installing it. Device(backend) returns a
 device unchanged and resolves a vendor backend to its device.
-See devices, selectdevice and defaultdevice!."""
+See devices, selectdevice and defaultdevice!. Every device keeps the
+`DebugConfig` it was made with in its `debug` field, and the channels
+`allocate_batch_queue!` handed out in its `channels` field."""
 abstract type Device <: KernelAbstractions.Backend end
 Device(d::Device) = d
 abstract type Resource end
@@ -28,19 +30,20 @@ todevice(b::KernelAbstractions.Backend) = Device(b)
 
 A presentation window; the short form uses defaultbackend(). isopen only queries
 state. run! pumps events, submits and presents; frame slots provide pacing.
-By default shaders write display-referred values; srgb=true encodes linear values."""
-abstract type Window end
+By default shaders write display-referred values; srgb=true encodes linear values.
+
+Core owns the platform window `handle` (GLFW) and whose frame it is (`acquirer`, the
+task holding an acquired image, `nothing` between frames); the backend owns
+`surface`, what frames draw into (`graphics/window.jl`)."""
+mutable struct Window{S}
+    handle::GLFW.Window
+    surface::S
+    acquirer::Union{Nothing,Task}
+    open::Bool
+end
 
 Window(width::Integer, height::Integer; kw...) =
     Window(defaultbackend(), width, height; kw...)
-
-"""backend(device)
-
-The KernelAbstractions backend for launches outside a graph. A backend returns
-itself. Within a graph, dispatch! declares accesses and derives ordering."""
-function backend end
-
-backend(b::KernelAbstractions.Backend) = b
 
 """screenshot(window) -> Matrix
 
@@ -105,6 +108,7 @@ function checklive(plan, regions, ntransients::Integer)
 end
 
 """Identity-based resource IDs for scheduling, with a reverse id-to-resource table.
+Native array views use their shared storage owner instead of wrapper identity.
 IDs are assigned in first-use order and remain stable within the graph."""
 struct IdTable
     ids::IdDict{Any,Int}
@@ -112,8 +116,16 @@ struct IdTable
 end
 IdTable() = IdTable(IdDict{Any,Int}(), Dict{Int,Any}())
 
+"""Stable storage owner used by native-array views; resources default to identity.
+
+Backends answer this allocation fact for their array type. Core interns all of
+its scalar/vector/reshape views together, so scheduling and synchronization do
+not mistake another view of a write for an unrelated buffer.
+"""
+resource_identity(r)=r
+
 """The id `r` is known by, assigning one if this is the first time it is named."""
-resourceid(t::IdTable, r) = get!(t.ids, r) do
+resourceid(t::IdTable, r) = get!(t.ids, resource_identity(r)) do
     id = length(t.ids) + 1
     t.by_id[id] = r
     id
@@ -121,11 +133,11 @@ end
 
 """What an id names. The inverse of [`resourceid`](@ref)."""
 byid(t::IdTable, id::Integer) = t.by_id[id]
-Base.haskey(t::IdTable, r) = haskey(t.ids, r)
+Base.haskey(t::IdTable, r) = haskey(t.ids, resource_identity(r))
 
 """Look up an existing resource ID. Unlike resourceid, this never registers a resource."""
-Base.getindex(t::IdTable, r) = t.ids[r]
-Base.get(t::IdTable, r, default) = get(t.ids, r, default)
+Base.getindex(t::IdTable, r) = t.ids[resource_identity(r)]
+Base.get(t::IdTable, r, default) = get(t.ids, resource_identity(r), default)
 Base.length(t::IdTable) = length(t.ids)
 
 """

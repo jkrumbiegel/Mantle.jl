@@ -86,22 +86,6 @@ struct DrawCall
 end
 
 """
-One hardware ray-tracing launch, declared like a dispatch: a pipeline, its
-arguments and a ray count. The arguments live at a fixed offset in the plan's
-`ArgMemory`, written once at `record!`, so a tracing plan can be recorded; packing
-them at run time from per-run scratch would leave a recorded plan pointing at
-memory the queue has reused.
-"""
-struct Trace
-    pipeline::Any
-    accel::Any
-    args::Tuple
-    # A count, in the same two shapes `Dispatch` takes it: a plain number, or a
-    # `DeviceRange` over a count only the GPU knows.
-    ndrange::Any
-end
-
-"""
     Loop
 
 One [`repeat!`](@ref) loop. Its body passes are compiled once and run `count`
@@ -110,9 +94,28 @@ device discarding the rest behind its gate. `index` is a one-element `Int32` dev
 buffer holding the current iteration, from 1, set before the loop and advanced in
 the body.
 """
-struct Loop
+mutable struct Loop
     count::Int
     index::Any
+    parent::Union{Nothing,Loop}
+end
+Loop(count::Int, index) = Loop(count, index, nothing)
+
+"""Whether `loop` belongs to `outer`, including `outer` itself."""
+function withinloop(loop::Union{Nothing,Loop}, outer::Loop)
+    while loop !== nothing
+        loop === outer && return true
+        loop = loop.parent
+    end
+    return false
+end
+
+"""The immediate child of `parent` on `loop`'s ancestry."""
+function childloop(loop::Loop, parent::Union{Nothing,Loop})
+    while loop.parent !== parent
+        loop = loop.parent
+    end
+    return loop
 end
 
 mutable struct Pass
@@ -129,13 +132,10 @@ mutable struct Pass
     draws::Vector{DrawCall}
     usages::Vector{Pair{Int,Type}}
     dispatches::Vector{Any}
-    # `nothing`, or the `(buffer, index)` whose 32-bit value decides whether this
-    # pass's work runs (see [`repeat!`](@ref)). Its barriers run either way, so a
-    # skipped iteration keeps the ordering intact. A pass property because the
-    # graph is a flat list the scheduler reorders.
+    # The device predicate read by this pass. Barriers run even when its work
+    # is discarded. Nested gates combine their enclosing predicates on device.
     predicate::Any
-    # `nothing`, or the [`Loop`](@ref) whose body this pass is in. The scheduler
-    # keeps a loop's passes together.
+    # The innermost loop containing this pass; ancestry lives in Loop.parent.
     loop::Any
 end
 
@@ -163,6 +163,8 @@ mutable struct TransientBuffer{T,N} <: TransientResource
     # transient raised SAM 2's encoder peak from 167 MB to 4.7 GB. `setindex!`
     # refuses undeclared transients.
     hostwritten::Bool
+    # Graph ownership is needed for declarative Readback(t); it is never packed.
+    graph::Any
 end
 
 # Stores start empty.
@@ -170,7 +172,7 @@ TransientBuffer{T,N}(dims::NTuple{N,Int}, first::Int, last::Int, block, offset::
                      hostwritten::Bool = false) where {T,N} =
     TransientBuffer{T,N}(dims, first, last, block, offset,
                          Tuple{UnitRange{Int},Vector{T}}[], ReentrantLock(), false,
-                         hostwritten)
+                         hostwritten, nothing)
 
 """
 A transient render target. The backend image exists from construction because the
@@ -248,6 +250,8 @@ mutable struct Graph{D}
     # Interning for `use(...; range = ...)`, keyed by value: `ids` is an IdDict, so
     # two equal slices would otherwise get two ids and no hazard between them.
     views::Dict{Tuple{Int,UnitRange{Int}},Any}
+    readbacks::Vector{Any}
+    readbacksealed::Bool
 end
 
 struct PassHandle
@@ -310,49 +314,6 @@ struct CompiledDraw{P,S,A,C,V,B,I}
 end
 
 """
-One dispatch, compiled when the plan is, so a frame only writes arguments and
-records. A per-frame KernelAbstractions launch recompiles whenever the world counter
-changes (any method definition), about 20 ms between acquire and present. `kernel`
-is the kernel function after `Adapt`, checked at plan build to be a singleton,
-since a closure over device arrays would go stale.
-"""
-struct CompiledDispatch{L,K,A<:Tuple,I,N,R,O,G}
-    # Concrete throughout, as in `CompiledDraw`. `L` is the backend's launch plan.
-    launch::L
-    iter::I                             # IterPlan for `nd0`
-    nd0::N                              # the ndrange the iteration plan was built for
-    obj::O                              # the KA kernel, for an ndrange that moves
-    # The workgroup `obj` needs at the call, or `nothing` when its type carries one
-    # (see `callgroup`).
-    group::G
-    kernel::K
-    args::A
-    ndrange::R
-    tlas::Bool                          # whether the pipeline was built for ray query
-    argoff::Int
-    argsize::Int
-    # The plan indirect command holding this dispatch's workgroup counts, 0 for a
-    # host ndrange. Fixed at compile, like `argoff`.
-    indirect::Int
-end
-
-"""
-A [`Trace`](@ref) resolved by the backend, shaped like [`CompiledDispatch`](@ref).
-Core reads only `argsize`, to reserve the argument slot. `accel` and `args` are held
-as given and resolved to storage once at `record!`; a value that changes between
-runs is a [`GPURef`](@ref), packed as its address.
-"""
-struct CompiledTrace{P,C,A<:Tuple,R}
-    compiled::P
-    accel::C
-    args::A
-    ndrange::R
-    argoff::Int
-    argsize::Int
-    indirect::Int            # as `CompiledDispatch.indirect`; 0 for a host ndrange
-end
-
-"""
 Argument memory owned by the plan: every draw's and dispatch's arguments, laid out
 once at compile, then one 256-byte indirect command per device-sized dispatch.
 Written once at `record!` and never again, so one copy suffices and no ring is
@@ -388,9 +349,9 @@ it, including the swapchain image's transition from whatever state acquire left.
 struct PassPlan{D,B}
     pass::Pass
     draws::Vector{CompiledDraw}
-    # What a compiled dispatch is on this backend: a `CompiledDispatch` when
-    # recording commands, a callable when driving KernelAbstractions. A parameter so
-    # the per-frame loop specialises.
+    # What a compiled dispatch is on this backend: its own compiled type when it
+    # records commands (`compile_dispatch`), a callable (`Launch`, `Call`) when it
+    # drives KernelAbstractions. A parameter so the per-frame loop specialises.
     dispatches::Vector{D}
     images::Vector{B}        # layout changes, one barrier each
     pre::Vector{Transition}      # what this pass needs before it runs
@@ -453,7 +414,8 @@ mutable struct Plan{D,H<:Tuple}
     # partition is noticed.
     partition::Vector{UnitRange{Int}}
     # The loops, as the contiguous range of `passes` each body was scheduled into
-    # and the loop it runs. Ascending and disjoint; empty for a plan without one.
+    # and the loop it runs. Ordered by start, parents before children; empty
+    # for a plan without loops. Child spans lie inside their parent span.
     loops::Vector{Tuple{UnitRange{Int},Loop}}
     # Whether the current recording (or walk) writes the profiler's timestamps,
     # so a run only asks for them when there are some to read.
@@ -505,10 +467,14 @@ mutable struct Compile{D} <: Compilation
     graph::Graph{D}
     alias::Bool
     policy::Policy
+    ordered_entry::Bool
     analysis::Analysis
     prepass::IdDict{Pass,Vector{Transition}}
     passes::Vector{PassPlan}                          # Pipelines
     pipelines::Set{Any}
+    # Whether the device records every pass (`recordspasses`): otherwise the plan
+    # is walked every run, and its dispatches are compiled for that.
+    recordsall::Bool
 end
 
 """

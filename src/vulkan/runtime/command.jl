@@ -42,7 +42,6 @@ import Vulkan.VkCore: VkMemoryBarrier, VK_STRUCTURE_TYPE_MEMORY_BARRIER,
     VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
     VkPipelineStageFlags, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
     VK_PIPELINE_STAGE_TRANSFER_BIT, VkDependencyFlags
 # `vkCmdPipelineBarrier` is a per-device pointer, resolved in the `LavaDevice`
 # constructor.
@@ -52,37 +51,14 @@ import Vulkan.VkCore: VkMemoryBarrier, VK_STRUCTURE_TYPE_MEMORY_BARRIER,
 const STAGE2_ALL_COMMANDS = VK.PipelineStageFlag2(VK.PIPELINE_STAGE_2_ALL_COMMANDS_BIT)
 
 """
-    recpatch!(owner, address, at)
+    patchsite(owner, target, base)
 
-Record that the eight bytes at host pointer `at`, in memory the recording owns,
-hold device address `address`. `pack_arg!` calls it for every pointer it writes.
-A [`Recording`](@ref) collects them for the plan's patch table, which a resource
-move consults (`closerecording!`); other owners ignore them.
+Where a pack into `target` (host address `base`) registers its device pointers
+with core's `notepacked!`: a [`Recording`](@ref)'s plan, whose patch table a
+resource move consults. A one-shot is never replayed, so its packs register nothing.
 """
-recpatch!(owner, address::UInt64, at::Ptr{UInt8}) = nothing
-recpatch!(rec::Recording, address::UInt64, at::Ptr{UInt8}) =
-    (push!(rec.patches, (address, at)); nothing)
-
-"""
-    recpatchfields!(owner, T, at)
-
-[`recpatch!`](@ref) every nonzero device pointer inside the packed `T` at `at`.
-Which fields hold pointers is core's `devicepointeroffsets`; collecting host
-pointers and resolving them to `(region, offset)` at seal (`patchtarget`) is
-this backend's. Not a method of core's `notepacked!`: core never calls it, and
-`test/test_backend_vocabulary.jl` rejects backend methods on core functions
-outside the vocabulary.
-"""
-@inline function recpatchfields!(owner, ::Type{T}, at::Ptr{UInt8}) where {T}
-    fields = devicepointeroffsets(T)
-    isempty(fields) && return nothing
-    for f in fields
-        addr = unsafe_load(Ptr{UInt64}(at + f))
-        addr == 0 && continue
-        recpatch!(owner, addr, at + f)
-    end
-    return nothing
-end
+patchsite(::Closed, target, base::Ptr{UInt8}) = nothing
+patchsite(rec::Recording, target, base::Ptr{UInt8}) = PatchSite(rec.plan, target, base)
 
 """Allocate one primary command buffer from the queue's pool. It stays with its
 `OneShot`, which core pools; a `Recording` borrows it until `release!`."""
@@ -101,13 +77,13 @@ const BEGIN_INFO_SIMULTANEOUS =
     VK._CommandBufferBeginInfo(flags = VK.COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)
 
 """
-    recording!(bq) -> Recording
+    recording!(bq, plan) -> Recording
 
-Open and begin a plan's command buffer with `SIMULTANEOUS_USE`, which is
+Open and begin `plan`'s command buffer with `SIMULTANEOUS_USE`, which is
 required: there is one recording per plan, and `run!` may submit it again while
 the previous run is still pending.
 """
-function recording!(bq::SubmitChannel{<:VulkanQueue})
+function recording!(bq::SubmitChannel{<:VulkanQueue}, pl::Plan)
     ownthread(bq)
     refuselost(deviceof(bq), "recording!")
     # Same pool as a one-shot: core's `acquire!` sweeps, returns a reset buffer
@@ -116,8 +92,7 @@ function recording!(bq::SubmitChannel{<:VulkanQueue})
     o = acquire!(bq)
     throw_if_error(bq, "vkBeginCommandBuffer",
         VK._begin_command_buffer(o.cmd, BEGIN_INFO_SIMULTANEOUS))
-    return Recording(bq, o.cmd, Region[], Any[], UInt64(0), true,
-                     Tuple{UInt64,Ptr{UInt8}}[], nothing, VkManagedBuffer[])
+    return Recording(bq, o.cmd, Region[], Any[], true, pl, nothing, VkManagedBuffer[])
 end
 
 """Close a command buffer: nothing more may be emitted, and it can be submitted.
@@ -144,17 +119,17 @@ submissionholds!(::SubmitChannel, ::Recording) = nothing
 
 Give back the recording's regions, holds, descriptor sets and command buffer;
 running it afterwards is an error. `Mantle.free!` on a plan calls it. Waits for
-the recording's last submission: the regions are only retired, but the command
-buffer goes on to serve one-shots, and re-beginning one the device still reads
-is undefined behaviour.
+the plan's last run (core's `argtoken`, 0 if it never ran), which every piece of
+its recording was in: the regions are only retired, but the command buffer goes
+on to serve one-shots, and re-beginning one the device still reads is undefined
+behaviour.
 """
 function release!(rec::Recording)
     bq = queueof(rec)
     dev = deviceof(bq)
-    let tok = rec.token
+    let tok = argtoken(rec.plan.args)
         tok == 0 || waitfor!(bq, tok)
     end
-    rec.token = 0
     rec.open && seal!(rec)          # takes the hold frame if it is still open
     # The hold list goes back to the channel's spares; `sealed!` takes a fresh
     # frame if this is recorded again.
@@ -414,7 +389,8 @@ function submitlist!(bq::SubmitChannel{<:VulkanQueue}, front::Union{Nothing,Clos
             VK.vk.VK_STRUCTURE_TYPE_SUBMIT_INFO_2, C_NULL, 0,
             UInt32(nw), pointer(raw_waits), UInt32(ncb), pointer(raw_cbs),
             UInt32(ns), pointer(raw_sigs))
-        VK.vk.vkQueueSubmit2(vkqueue(bq).vks, UInt32(1), pointer(raw_subs), vkfence, fptr)
+        @lock queuelock(bq) VK.vk.vkQueueSubmit2(vkqueue(bq).vks, UInt32(1),
+                                                  pointer(raw_subs), vkfence, fptr)
     end
     if submit_result != VK.vk.VK_SUCCESS
         # The raw call has no result wrapper, so mark device loss here. Nothing
@@ -423,7 +399,7 @@ function submitlist!(bq::SubmitChannel{<:VulkanQueue}, front::Union{Nothing,Clos
         throw(LavaError("vkQueueSubmit2",
             "queue submission failed with $(submit_result) " *
             "($(ncb) command buffer(s), last dispatch: $(driver(bq).last_dispatch_info))",
-            "If the device is lost, call reset_device!() or restart Julia."))
+            "If the device is lost, call reset_device!(device) or restart Julia."))
     end
 
     # Submitted: this token is now the last work naming these buffers.
@@ -514,7 +490,7 @@ end
     bindtlas!(emitter, pipeline, tlas)
 
 Bind an acceleration structure at set 0, binding 0, and hold everything a ray
-query reads. A no-op for `nothing`; the `VulkanTLAS` method is in
+query reads. A no-op for `nothing`; the `BatchedTLAS` method is in
 `raytracing/hwtlas.jl`.
 """
 @inline bindtlas!(::Emitter, ::LavaComputePipeline, ::Nothing) = nothing
@@ -600,21 +576,6 @@ escape, so this allocates nothing.
 end
 
 """
-Barrier between an unmodelled prepare and the indirect launch that reads what it
-wrote, inside one one-shot: makes the prepare's shader writes visible to the
-indirect read and the launch's own reads. Plans get this from `emitprepares!`.
-`dst_stage` and `extra_dst_access` name the consumer (compute or ray tracing).
-"""
-@inline function indirectbarrier!(e::Emitter, dst_stage::VK.PipelineStageFlag,
-                                  extra_dst_access::VK.AccessFlag)
-    dst_access = VkAccessFlags(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT) |
-                 VkAccessFlags(extra_dst_access)
-    memorybarrier!(e.cmd,e.ctx,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,dst_stage,
-                   VK_ACCESS_SHADER_WRITE_BIT,dst_access)
-    return nothing
-end
-
-"""
     query_timeline(bq::SubmitChannel{<:VulkanQueue}) -> UInt64
 
 Current counter of `timelineof(bq)`. Raw and allocation-free because every sweep
@@ -626,8 +587,7 @@ so the throw only fires if the device died in between.
     # The shared counter cell belongs to the owning thread; another thread gets a
     # fresh `Ref`. Two threads writing one cell could return a wrong counter, and
     # a token reported passed too early is a use-after-free.
-    ref = Threads.threadid() == bq.thread ?
-          (driver(bq).slots).counter : Ref(UInt64(0))
+    ref = Threads.threadid() == bq.thread ? driver(bq).counter : Ref(UInt64(0))
     fptr = VK.function_pointer(VK.global_dispatcher[], vkdevice(bq),
                                :vkGetSemaphoreCounterValue)
     res = VK.vk.vkGetSemaphoreCounterValue(vkdevice(bq).vks, timelineof(bq).vks,
@@ -639,51 +599,86 @@ so the throw only fires if the device died in between.
     e = unwrap_error(result)::VK.VulkanError
     throw(LavaVulkanError("get_semaphore_counter_value", Int32(e.code), e.msg,
         e.code == VK.ERROR_DEVICE_LOST ?
-            "Device lost. Call reset_device!() to reinitialize, or restart Julia." :
+            "Device lost. Call reset_device!(device) to reinitialize, or restart Julia." :
             "Timeline semaphore query failed with an unexpected VkResult. " *
             "This is a driver bug, stack corruption, or an invalid semaphore handle."))
 end
 
 """
+One wait for a queue's timeline to reach `value`, as a worker thread performs it.
+The handles and the entry point are resolved on the calling thread, so the worker
+reads nothing the queue's thread may be changing. A bits type, so handing it to a
+worker boxes nothing ([`hostwait`](@ref)); the queue, which keeps the semaphore
+alive, stays with the waiting task, which also polls it.
+"""
+struct TimelineWait
+    device::VK.vk.VkDevice
+    semaphore::VK.vk.VkSemaphore
+    value::UInt64
+    timeout::UInt64
+    fptr::Ptr{Cvoid}                # vkWaitSemaphores
+end
+
+TimelineWait(bq::SubmitChannel{<:VulkanQueue}, value::UInt64, timeout::UInt64) =
+    TimelineWait(vkdevice(bq).vks, timelineof(bq).vks, value, timeout,
+                 VK.function_pointer(VK.global_dispatcher[], vkdevice(bq), :vkWaitSemaphores))
+
+# On the worker: GC-safe, so a collection elsewhere does not wait for the device.
+function blockon(w::TimelineWait)
+    sem, val, fptr = Ref(w.semaphore), Ref(w.value), w.fptr
+    GC.@preserve sem val begin
+        info = Ref(VK.vk.VkSemaphoreWaitInfo(VK.vk.VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            C_NULL, VK.vk.VkSemaphoreWaitFlags(0), UInt32(1),
+            Base.unsafe_convert(Ptr{VK.vk.VkSemaphore}, sem),
+            Base.unsafe_convert(Ptr{UInt64}, val)))
+        GPUToolbox.@gcsafe_ccall $fptr(w.device::VK.vk.VkDevice,
+            info::Ptr{VK.vk.VkSemaphoreWaitInfo}, w.timeout::UInt64)::VK.vk.VkResult
+    end
+end
+
+"""
+    timelinewait(bq, w::TimelineWait) -> VkResult
+
+Wait as `w` says for `bq`'s timeline without holding the thread
+([`hostwait`](@ref)): `VK_SUCCESS` when the poll saw the value, otherwise what
+`vkWaitSemaphores` returned.
+"""
+function timelinewait(bq::SubmitChannel{<:VulkanQueue}, w::TimelineWait)
+    r = hostwait(blockon, w -> query_timeline(bq) >= w.value, w)
+    return r === nothing ? VK.vk.VK_SUCCESS : something(r)
+end
+
+"""
+    checkedresult(res::VkResult, call) -> Result
+
+A raw `VkResult` as the `Result` Vulkan.jl's checked wrappers return, built the
+way they build it, so a call made off them (by a worker thread, which must not
+touch the context) is raised by the same `throw_if_error` and
+`throw_with_validation_context` as every other call.
+"""
+function checkedresult(res::VK.vk.VkResult, call::String)::VK.ResultTypes.Result{VK.Result,VK.VulkanError}
+    code = Int32(res)
+    code < 0 && return VK.VulkanError(string("failed to execute ", call), VK.Result(code))
+    return VK.Result(code)
+end
+
+"""
     wait_timeline!(bq, val)
 
-Block until this queue's timeline reaches `val`. Raw, through the queue's slots,
-so a wait allocates nothing; errors fall through to the checked wrapper, which
-throws with context.
+Wait until this queue's timeline reaches `val`, yielding the thread while it does
+([`hostwait`](@ref)). Throws a failed wait with the queue's context.
 """
 function wait_timeline!(bq::SubmitChannel{<:VulkanQueue}, val::UInt64)
-    # The slots belong to the owning thread; other threads take the checked wrapper.
-    if Threads.threadid() != bq.thread
-        wait_semaphores!(bq, VK.SemaphoreWaitInfo([timelineof(bq)], [val]))
-        return nothing
-    end
-    slots = driver(bq).slots
-    slots.wait_sems[1] = timelineof(bq).vks
-    slots.wait_values[1] = val
-    fptr = VK.function_pointer(VK.global_dispatcher[], vkdevice(bq), :vkWaitSemaphores)
-    res = GC.@preserve slots begin
-        slots.wait_info[] = VK.vk.VkSemaphoreWaitInfo(
-            VK.vk.VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, C_NULL, 0,
-            UInt32(1), pointer(slots.wait_sems), pointer(slots.wait_values))
-        VK.vk.vkWaitSemaphores(vkdevice(bq).vks, slots.wait_info, typemax(UInt64), fptr)
-    end
-    res == VK.vk.VK_SUCCESS && return nothing
-    wait_semaphores!(bq, VK.SemaphoreWaitInfo([timelineof(bq)], [val]))  # throws
+    res = timelinewait(bq, TimelineWait(bq, val, typemax(UInt64)))
+    throw_if_error(bq, "vkWaitSemaphores", checkedresult(res, "vkWaitSemaphores"))
     return nothing
 end
 
-"""
-    waitfor!(bq, token)
-
-Block until this queue's timeline reaches `token`. A token belongs to one queue's
-timeline; the device-level `waitfor!(dev, tok)` waits on the primary queue and is
-wrong for work submitted on another.
-"""
-function waitfor!(bq::SubmitChannel{<:VulkanQueue}, tok::UInt64)
-    passed(bq, tok) && return nothing
-    wait_timeline!(bq, tok)
-    return nothing
-end
+# This queue's timeline: its newest submission's value, and a wait on it. A token
+# belongs to one queue's timeline: the device's waits on its primary queue and is
+# wrong for work submitted on another.
+issued(bq::SubmitChannel{<:VulkanQueue}) = driver(bq).next_timeline
+awaittoken!(bq::SubmitChannel{<:VulkanQueue}, tok::UInt64) = (wait_timeline!(bq, tok); nothing)
 
 # Fallible Vulkan calls go through `throw_if_error`, or `mark_if_lost!` for
 # callers with their own recovery, so every DEVICE_LOST sets the flag the entry
@@ -706,7 +701,7 @@ end
 
 device_lost_hint(call) =
     "Vulkan device is lost during $(call). " *
-    "Call reset_device!() to reinitialize, or restart Julia."
+    "Call reset_device!(device) to reinitialize, or restart Julia."
 
 """
     throw_if_error(bq::SubmitChannel{<:VulkanQueue}, result)
@@ -726,15 +721,6 @@ Return the unwrapped value on success. On error, mark device loss for
 end
 @inline throw_if_error(ctx::LavaDevice, result) = throw_if_error(ctx, "Vulkan call", result)
 @inline throw_if_error(bq::SubmitChannel{<:VulkanQueue}, args...) = throw_if_error(deviceof(bq), args...)
-
-"""
-    wait_for_fences!(bq, fences; wait_all=true, timeout=typemax(UInt64))
-
-`vkWaitForFences` through `throw_if_error`.
-"""
-@inline wait_for_fences!(bq::SubmitChannel{<:VulkanQueue}, fences;
-                         wait_all::Bool=true, timeout::UInt64=typemax(UInt64)) =
-    throw_if_error(bq, "vkWaitForFences", VK.wait_for_fences(vkdevice(bq), fences, wait_all, timeout))
 
 """
     wait_semaphores!(bq, info; timeout=typemax(UInt64))
@@ -799,9 +785,9 @@ function flush!(bq::SubmitChannel{<:VulkanQueue}, ::Device)
     budget = driver(bq).flush_timeout_ns
     quantum = budget == 0 ? typemax(UInt64) : min(budget, FLUSH_WAIT_QUANTUM_NS)
     waited = UInt64(0)
+    w = TimelineWait(bq, target, quantum)
     while true
-        wait_result = VK.wait_semaphores(vkdevice(bq),
-            VK.SemaphoreWaitInfo([timelineof(bq)], [target]), quantum)
+        wait_result = checkedresult(timelinewait(bq, w), "vkWaitSemaphores")
         if iserror(wait_result)
             # Adds validation messages and the dispatch log to the error.
             mark_if_lost!(bq, wait_result)
@@ -816,7 +802,7 @@ function flush!(bq::SubmitChannel{<:VulkanQueue}, ::Device)
         # status, empty submit and zero-timeout wait did not). It runs only after
         # a quantum without progress, where blocking until idle is what `flush!`
         # wants anyway.
-        let st = VK.queue_wait_idle(vkqueue(bq))
+        let st = @lock queuelock(bq) VK.queue_wait_idle(vkqueue(bq))
             iserror(st) && mark_if_lost!(bq, st)
         end
         if device_lost(deviceof(bq))
@@ -826,10 +812,10 @@ function flush!(bq::SubmitChannel{<:VulkanQueue}, ::Device)
                             "$(length(bq.outstanding)) submission(s) outstanding)",
                             "The GPU faulted — a dispatch wrote out of bounds or hung. " *
                             "Raising `driver(bq).flush_timeout_ns` cannot help; call " *
-                            "`reset_device!()` to reinitialize. To find the " *
+                            "`reset_device!(device)` to reinitialize. To find the " *
                             "dispatch: `journalctl -k` for an NVIDIA Xid names the fault " *
                             "class, and " *
-                            "`reset_device!(debug = DebugConfig(gpu_av = true, " *
+                            "`reset_device!(device; debug = DebugConfig(gpu_av = true, " *
                             "gpu_av_shaders = [\"my_kernel\"], pool_disabled = true))` " *
                             "instruments the shaders — that rebuilds the device, so every " *
                             "LavaArray alive is invalid afterwards, and `verify_gpu_av()` " *
@@ -892,7 +878,7 @@ function throw_with_validation_context(call_name::String, err_result,
         bq::Union{Nothing,SubmitChannel{<:VulkanQueue}}=nothing)
     # `bq`'s context, or the bound one without `bq`: its messages, and dispatch
     # logging re-enabled so the next run records names.
-    ctx = bq === nothing ? VK_CONTEXT_REF[] : deviceof(bq)
+    ctx = bq === nothing ? existingdefault(VulkanAPI()) : deviceof(bq)
     ctx === nothing || (ctx.diag.dispatch_logging = true)
     vk_err = unwrap_error(err_result)
     msgs = get_validation_messages(ctx)
@@ -922,7 +908,7 @@ Crashed submission's dispatch: $prev_info
 Triggered by recording: $curr_info
 $validation_detail
 $dispatch_detail""",
-        "DEVICE_LOST usually means invalid SPIR-V, out-of-bounds BDA access, or GPU timeout (Xid 109). Check dispatch log above for the crashing kernel. Call reset_device!() to reinitialize."
+        "DEVICE_LOST usually means invalid SPIR-V, out-of-bounds BDA access, or GPU timeout (Xid 109). Check dispatch log above for the crashing kernel. Call reset_device!(device) to reinitialize."
     ))
 end
 

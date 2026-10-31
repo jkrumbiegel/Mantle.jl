@@ -13,6 +13,7 @@ function in this module instead of adding a method.
 module MantleROCmExt
 
 import AMDGPU
+import Adapt
 import GPUArrays
 import KernelAbstractions as KA
 import KernelInterface as KI
@@ -20,7 +21,7 @@ import Mantle
 import LinearAlgebra
 import Libdl
 using Mantle: Pool, Buffers, Images, Persistent, TransientBuffer, DeviceArray,
-    DeviceInfo, ROCmAPI, register_backend!, selectdevice
+    DeviceInfo, ROCmAPI, register_backend!, selectdevice, adopt!
 using KernelInterface: DeviceCaps, MatrixShape
 
 const Managed = AMDGPU.Managed
@@ -99,22 +100,18 @@ end
 
 """Make this device's stream the current task's. Idempotent; does not restore the
 previous stream (see `ROCmDevice`)."""
-@inline function adopt!(d::ROCmDevice)
+@inline function Mantle.adopt!(d::ROCmDevice)
     AMDGPU.stream() == d.stream || AMDGPU.stream!(d.stream)
     return d
 end
 
-# One cached device per process: a second `ROCmDevice` would put a second `Pool`
-# over the same memory.
-const ROCM_DEVICE = Ref{Union{Nothing,ROCmDevice}}(nothing)
-
-function Mantle.Device(::ROCmAPI; select = nothing)
-    if select === nothing
-        d = ROCM_DEVICE[]
-        d === nothing || return adopt!(d)
-        return ROCM_DEVICE[] = ROCmDevice(AMDGPU.device())
-    end
-    return ROCmDevice(AMDGPU.devices()[selectdevice(select, Mantle.devices(ROCmAPI()))])
+# Core keeps the default device (`runtime/lifecycle.jl`). ROCm has no validation
+# layer, so the only configuration is the default one.
+function Mantle.makedevice(::ROCmAPI, select, debug::Mantle.DebugConfig)
+    debug == Mantle.DebugConfig() || throw(ArgumentError(
+        "ROCm: there is no validation layer to configure; leave `debug` at its default"))
+    return ROCmDevice(select === nothing ? AMDGPU.device() :
+                      AMDGPU.devices()[selectdevice(select, Mantle.devices(ROCmAPI()))])
 end
 
 # `integrated` drives the selector's ranking; on an APU device memory is system
@@ -125,15 +122,20 @@ Mantle.devices(::ROCmAPI) =
                 "ROCm $(AMDGPU.HIP.runtime_version())")
      for (i, d) in enumerate(AMDGPU.devices())]
 
-Mantle.defaultdevice!(d::ROCmDevice) = (ROCM_DEVICE[] = d; adopt!(d))
+# The Mantle device of AMDGPU.jl's backend, which is what `KA.get_backend` of a
+# `ROCArray` returns.
 Mantle.Device(::AMDGPU.ROCBackend) = Mantle.Device(ROCmAPI())
+# A backend's `==` is "the same device" (see the Metal backend); `isequal` stays
+# identity, so hashing asks nothing of AMDGPU.jl's type.
+Base.:(==)(b::AMDGPU.ROCBackend, d::ROCmDevice) = Mantle.Device(b) === d
+Base.:(==)(d::ROCmDevice, b::AMDGPU.ROCBackend) = b == d
+Base.isequal(::AMDGPU.ROCBackend, ::ROCmDevice) = false
+Base.isequal(::ROCmDevice, ::AMDGPU.ROCBackend) = false
 Mantle.pool(d::ROCmDevice) = d.pool
-Mantle.backend(::ROCmDevice) = AMDGPU.ROCBackend()
 Mantle.accesscache(d::ROCmDevice) = d.accesses
 Mantle.devicebuffertype(::ROCmDevice, ::Type{T}, N::Int) where {T} =
     AMDGPU.Device.ROCDeviceArray{T,N,1}
-Mantle.argtype(d::ROCmDevice, y) =
-    Core.Typeof(KI.argconvert(Mantle.kibackend(d), y))
+Mantle.argtype(d::ROCmDevice, y) = Core.Typeof(KI.argconvert(d, y))
 Mantle.isdevicearray(::AMDGPU.Device.ROCDeviceArray) = true
 
 function Mantle.kernelinterpreter(d::ROCmDevice, f, tt)
@@ -206,20 +208,20 @@ end
 
 Mantle.passed(d::ROCmDevice, f) = UInt64(f) <= d.completed
 
+# A token no retirement has been handed: nothing will ever cover it, and core's
+# `waitfor!` makes the refusal an error.
+Mantle.issued(d::ROCmDevice) = d.next
+
 """
 Wait until the timeline reaches `f`, with a full stream synchronise: this backend
-cannot observe the submission that reads a region. `issued` is read before the
+cannot observe the submission that reads a region. `next` is read before the
 wait, so the sync is credited only with the retirements it covered.
 """
-function Mantle.waitfor(d::ROCmDevice, f)
-    Mantle.passed(d, f) && return true
-    # A token no retirement has been handed: nothing will ever cover it, and
-    # core's `waitfor!` makes the refusal an error.
-    UInt64(f) > d.next && return false
-    issued = d.next
+function Mantle.awaittoken!(d::ROCmDevice, ::UInt64)
+    upto = d.next
     Mantle.waitidle(d)
-    d.completed = max(d.completed, issued)
-    return true
+    d.completed = max(d.completed, upto)
+    return nothing
 end
 
 # ── regions as arrays ────────────────────────────────────────────────────────
@@ -340,10 +342,10 @@ function (d::ROCmCompiledDispatch)()
 end
 
 # No argument memory and no indirect slot: arguments are passed directly, and a
-# `DeviceRange` launches its ceiling. Same as `MetalRecordedDispatch`.
+# `DeviceRange` launches its ceiling.
 Mantle.argsize(::ROCmCompiledDispatch) = 0
 Mantle.indirectindex(::ROCmCompiledDispatch) = 0
-Mantle.devicesized(::ROCmCompiledDispatch) = false
+Mantle.workgroupsize(d::ROCmCompiledDispatch) = UInt32(prod(d.groupsize))
 
 # ── calls ────────────────────────────────────────────────────────────────────
 #
@@ -364,8 +366,7 @@ The occupancy limit must be shaped to the ndrange; reading the size
 2.1's encoder.
 """
 function kicompile(c::Mantle.Compile{ROCmDevice}, dev::ROCmDevice, d::Mantle.Dispatch)
-    be = Mantle.kibackend(dev)
-    args = map(a -> Mantle.resolve(dev, a), d.args)
+    args = Mantle.resolve(dev, d.args)
     nd = Mantle.dispatchrange(d.ndrange)
     kern = Mantle.kikernel(d.kernel, dev, args)
     wg, ng = Mantle.ki_launch_extents(kern, Mantle.groupdims(nd), d.group)
@@ -391,43 +392,23 @@ function Mantle.compile_dispatch(c::Mantle.Compile{ROCmDevice}, d::Mantle.Dispat
     # A call (no ndrange): core's `bake` returns a `Mantle.Call`, capturable here.
     Mantle.iscall(d) && return Mantle.bake(c, d)
     # A plain-function kernel goes through KernelInterface.
-    Mantle.buildskernel(d.kernel, Mantle.backend(dev)) || return kicompile(c, dev, d)
+    Mantle.buildskernel(d.kernel, dev) || return kicompile(c, dev, d)
     obj = Mantle.kernelfor(d, dev)
-    args = map(a -> Mantle.resolve(dev, a), d.args)
-    nd = Mantle.dispatchrange(d.ndrange)
+    args = Mantle.resolve(dev, d.args)
     # `callgroup`, not `nothing`: a `DynamicSize` kernel launched with
     # `workgroupsize = wg` carries it nowhere else, and dropping it lets the
     # autotune pick a size a body reading its size from a `Val` disagrees with.
-    group = Mantle.callgroup(obj, d.group)
-    ndrange, _, iterspace, _ = KA.launch_config(obj, nd, group)
-    ctx = KA.mkcontext(obj, ndrange, iterspace)
-    kernel, ctx, iterspace = hipcompile(obj, args, ndrange, group, ctx, iterspace)
-    return ROCmCompiledDispatch(kernel, ctx, args, d.args,
-                                length(KA.workitems(iterspace)),
-                                length(KA.blocks(iterspace)))
-end
-
-"""
-The HIP kernel for this body and argument types, and the iteration space it is
-compiled for. Types come from the `rocconvert`ed arguments, which are the
-kernel's parameters. A `DynamicSize` body launched without a requested `group`
-is repartitioned by its occupancy, as `ROCKernels` does per launch, and
-recompiled if the context type changes. `group` is the caller's request, not
-`KA.launch_config`'s result, which substitutes a default and would skip the
-autotune.
-"""
-function hipcompile(obj, args, ndrange, group, ctx, iterspace)
-    tt = hiptypes(ctx, args)
-    kernel = AMDGPU.hipfunction(obj.f, tt)
-    if KA.workgroupsize(obj) <: KA.DynamicSize && group === nothing
-        (; groupsize) = AMDGPU.launch_configuration(kernel)
-        ws = KI.threads_to_workgroupsize(groupsize, ndrange)
-        iterspace, _ = KA.partition(obj, ndrange, ws)
-        ctx = KA.mkcontext(obj, ndrange, iterspace)
-        tt2 = hiptypes(ctx, args)
-        tt2 === tt || (kernel = AMDGPU.hipfunction(obj.f, tt2))
-    end
-    return kernel, ctx, iterspace
+    # A `DynamicSize` body launched without a requested `group` is repartitioned
+    # by its occupancy, as `ROCKernels` does per launch. `group` is the caller's
+    # request, not `KA.launch_config`'s result, which substitutes a default and
+    # would skip the autotune.
+    kernel, shape = Mantle.tunedlaunch(ctx -> AMDGPU.hipfunction(obj.f, hiptypes(ctx, args)),
+                                       (k, nd) -> KI.threads_to_workgroupsize(
+                                           AMDGPU.launch_configuration(k).groupsize, nd),
+                                       obj, Mantle.dispatchrange(d.ndrange),
+                                       Mantle.callgroup(obj, d.group))
+    return ROCmCompiledDispatch(kernel, shape.ctx, args, d.args,
+                                Mantle.groupthreads(shape), Mantle.groupcount(shape))
 end
 
 hiptypes(ctx, args) =
@@ -447,11 +428,9 @@ Mantle.recordsplans(::ROCmDevice) = true
 
 # ── profiling ────────────────────────────────────────────────────────────────
 
-"""
-A profiled plan is walked every run instead of replayed: a replay has no pass
-walk to bracket with timing events.
-"""
-Mantle.recordable(::ROCmDevice, pl::Mantle.Plan) = Mantle.recordable(pl) && !pl.profile
+# A profiled plan is walked every run instead of replayed: a captured graph has no
+# pass walk to bracket with timing events.
+Mantle.recordsprofiled(::ROCmDevice) = false
 
 # Timing HIP events around each pass on the device stream; waiting on the stop
 # event serialises a profiled run.
@@ -778,10 +757,12 @@ end
 """
 A plan's recording: the executable graph, and the graph it came from, kept
 reachable so its `hipGraphDestroy` finalizer cannot run while the exec lives.
+Concrete, so core's `submitplan!` narrows `Plan.recording` to it statically; a
+parametric one left every run building a boxed one-piece batch.
 """
-struct ROCmRecording{E,G}
-    exec::E
-    graph::G
+struct ROCmRecording
+    exec::AMDGPU.HIP.HIPGraphExec
+    graph::AMDGPU.HIP.HIPGraph
 end
 
 """
@@ -853,21 +834,20 @@ Mantle.closerun!(d::ROCmDevice, pl::Mantle.Plan, ::Mantle.Immediate) = submitrun
 Mantle.closerun!(d::ROCmDevice, pl::Mantle.Plan, ::Nothing) = submitrun!(d, pl)
 
 function submitrun!(d::ROCmDevice, pl::Mantle.Plan)
-    rec = pl.recording
-    # Through `submitrecording!`: core iterates a partitioned `RecordingParts`.
-    rec === nothing || Mantle.submitrecording!(d, rec, nothing)
+    # Through core's `submitplan!`, which iterates a partitioned `RecordingParts`.
+    pl.recording === nothing || Mantle.submitplan!(d, pl, nothing, ROCmRecording)
     # The token `waitfor!(plan)` waits on; waiting on it is a full synchronise.
     return Mantle.fence(d)
 end
 
 """
-    submitrecording!(dev, recording, emitter)
+    submitpiece!(dev, recording, emitter)
 
 Launch one captured graph on the device stream. The emitter is always empty
 here, since `openrun` returns `Immediate`. A partitioned recording is several of
 these in order on the same in-order stream.
 """
-function Mantle.submitrecording!(d::ROCmDevice, rec::ROCmRecording, _)
+function Mantle.submitpiece!(d::ROCmDevice, rec::ROCmRecording, _)
     adopt!(d)
     AMDGPU.HIP.launch(rec.exec, d.stream)
     return nothing
@@ -895,7 +875,7 @@ Mantle.patchable(::ROCmDevice) = false
 
 """
 `false`. Core's interpreted `withpredicate` reads the flag on the host
-(`storage(pred)[i + 1].go`), a scalar index AMDGPU.jl refuses and a stream
+(`gateopen`), a scalar index AMDGPU.jl refuses and a stream
 synchronise per gated pass, so a gated pass with fixed-size work is refused at
 graph build. A gated pass of only `DeviceRange` dispatches needs `emitkernel!`,
 which this backend does not implement, so `repeat!` is unsupported here.
@@ -940,6 +920,44 @@ end
 
 Mantle.caps(b::AMDGPU.ROCBackend) = Mantle.caps(Mantle.Device(b))
 
+# ── KernelInterface ──────────────────────────────────────────────────────────
+#
+# A `ROCmDevice` is a KernelInterface backend, as every `Device` is. AMDGPU.jl
+# implements the vocabulary for its `ROCBackend`, which works on the task's
+# current stream; the device answers each verb as that backend after making its
+# own stream current (`adopt!`), so a launch, an allocation or a copy goes to the
+# device's stream from any task.
+
+const ROC = AMDGPU.ROCBackend()
+
+KI.allocate(d::ROCmDevice, ::Type{T}, dims::Tuple) where {T} = (adopt!(d); KI.allocate(ROC, T, dims))
+KI.synchronize(d::ROCmDevice) = Mantle.waitidle(d)
+KI.copyto!(d::ROCmDevice, dest, src) = (adopt!(d); KI.copyto!(ROC, dest, src))
+KI.versioninfo(io::IO, ::ROCmDevice) = KI.versioninfo(io, ROC)
+KI.supports_shuffle(::ROCmDevice, ::Type{T}) where {T} = KI.supports_shuffle(ROC, T)
+KI.argconvert(::ROCmDevice, x) = KI.argconvert(ROC, x)
+KI.kernel_function(d::ROCmDevice, f::F, tt::TT = Tuple{}; kwargs...) where {F,TT} =
+    (adopt!(d); KI.kernel_function(ROC, f, tt; kwargs...))
+KI.record_event(d::ROCmDevice) = (adopt!(d); KI.record_event(ROC))
+KI.wait_event(d::ROCmDevice, ev::AMDGPU.HIP.HIPEvent) = (adopt!(d); KI.wait_event(ROC, ev))
+for f in (:functional, :supports_float64, :supports_atomics, :supports_unified,
+          :supports_subgroups, :shfl_types, :sub_group_reduce_add_types)
+    @eval KI.$f(::ROCmDevice) = KI.$f(ROC)
+end
+# Device queries read the current device, which `adopt!` makes this one.
+for f in (:max_work_group_size, :max_work_group_dims, :max_num_groups, :sub_group_size,
+          :multiprocessor_count)
+    @eval KI.$f(d::ROCmDevice) = (adopt!(d); KI.$f(ROC))
+end
+
+# AMDGPU.jl's KernelAbstractions extension tells the compiler a static workgroup
+# size; the same kernel built on the device asks it the same way.
+KA.compiler_options(obj::KA.Kernel{ROCmDevice,W,N,F}) where {W,N,F} =
+    KA.compiler_options(KA.Kernel{AMDGPU.ROCBackend,W,N,F}(ROC, obj.f))
+
+# `Adapt.adapt(dev, x)` uploads to the device.
+Adapt.adapt_storage(d::ROCmDevice, x) = (adopt!(d); Adapt.adapt_storage(ROC, x))
+
 # A library call is a pass declared with the three-argument `dispatch!`, which
 # states the written operand; `mul!` on a `ROCArray` then reaches rocBLAS:
 #     dispatch!(p, mul!, (use(p, C; write = true), use(p, A; read = true),
@@ -960,7 +978,7 @@ function __init__()
         end
     end
     register_backend!(; name = :rocm, priority = 50) do
-        AMDGPU.functional() ? AMDGPU.ROCBackend() : nothing
+        AMDGPU.functional() ? Mantle.Device(ROCmAPI()) : nothing
     end
 end
 

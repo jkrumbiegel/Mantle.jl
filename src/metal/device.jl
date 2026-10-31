@@ -96,68 +96,72 @@ pinpipeline!(bq) = Metal.inflight!(bq, 8)
 The submission generation for `mtldevice`: `LegacyQueue`. On MTL4 queues
 `executeCommandsInBuffer:` stops completing after about a second of cumulative
 replayed work (M5), so MTL4 encodes recorded dispatches instead of replaying
-them and is opt-in via `MetalDevice(dev, MTL4Queue(dev))`.
+them and is opt-in via `MetalDevice(dev, MTL4Queue(dev))`, which core does not register,
+so the exit hook does not retire it.
 """
 metalqueue(dev::MTL.MTLDevice) = LegacyQueue(dev)
 
 function MetalDevice(mtldev::MTL.MTLDevice, q, debug::DebugConfig = DebugConfig())
     checkdebug(mtldev, debug)
-    d = MetalDevice(mtldev, q, Pool(), nothing, AccessCache(), CompilationCache{Any,Any}(),
-                    Dict{UInt,Metal.Managed}(), debug, false, Metal.ConcreteBatchedQueue[], 0)
-    # Registered before anything allocates on it, so the exit hook reaches it.
-    push!(METAL.live, WeakRef(d))
-    return d
+    return MetalDevice(mtldev, q, Pool(), nothing, AccessCache(), CompilationCache{Any,Any}(),
+                       Dict{UInt,Metal.Managed}(), debug, false, Metal.ConcreteBatchedQueue[], 0)
 end
 MetalDevice(mtldev::MTL.MTLDevice = Metal.device()) = MetalDevice(mtldev, metalqueue(mtldev))
 
 """
-Process-wide Metal state. `default` is the one device `Device(MetalAPI())`
-returns (a second would put a second `Pool` over the same memory). `live` holds
-every device weakly so the exit hook can retire it. `reports`, `reportlock` and
-`reporter` belong to the process-wide validation report block (`debug.jl`).
+Process-wide Metal validation state, for the report block (`debug.jl`): `reports`,
+`reportlock` and `reporter`. The devices are core's (`runtime/lifecycle.jl`).
 """
 mutable struct MetalProcess
-    default::Union{Nothing,MetalDevice}
-    live::Vector{WeakRef}
     reports::Vector{String}
     reportlock::ReentrantLock
     # The block given to `MTLSetReportFailureBlock`, rooted here because Metal
     # holds it only by pointer.
     reporter::Any
 end
-const METAL = MetalProcess(nothing, WeakRef[], String[], ReentrantLock(), nothing)
+const METAL = MetalProcess(String[], ReentrantLock(), nothing)
 
-function Device(::MetalAPI; select = nothing, debug::Union{Nothing,DebugConfig} = nothing)
-    if select === nothing && debug === nothing
-        d = METAL.default
-        d === nothing || return d
-        # Metal.jl's own choice; `defaultdevice!(select)` is how a caller picks another.
-        return defaultdevice!(MetalDevice(Metal.device()))
-    end
-    # A device selected by name or with a debug configuration is not the process
-    # device and does not adopt the queue (see `defaultdevice!`).
+# A device selected by name or with a debug configuration is not made the process
+# device by core, and so does not adopt the queue (see `adopt!`).
+function makedevice(::MetalAPI, select, debug::DebugConfig)
     mtldev = select === nothing ? Metal.device() :
              Metal.devices()[selectdevice(select, devices(MetalAPI()))]
-    return MetalDevice(mtldev, metalqueue(mtldev), something(debug, DebugConfig()))
+    return MetalDevice(mtldev, metalqueue(mtldev), debug)
 end
+
 # One entry per `MTLDevice`; `:integrated` means unified memory (Apple silicon).
 devices(::MetalAPI) = [DeviceInfo(i, String(d.name), d.hasUnifiedMemory ? :integrated : :discrete, "Metal")
                        for (i, d) in enumerate(Metal.devices())]
-"""
-    defaultdevice!(d) -> d
 
-Make `d` the device this process hands out and the one Metal.jl launches on.
-Adopts the queue here, not in the constructor (a second `MetalDevice` would take
-it from the process device) and not only in `enterrun!` (an upload before the
-first run would go to the task's own queue, unordered against the replay).
-"""
-defaultdevice!(d::MetalDevice) = (METAL.default = d; adoptqueue!(d); d)
+# The default device is the one Metal.jl launches on: adopting its queue here, not
+# in the constructor (a second `MetalDevice` would take it from the process device)
+# and not only in `enterrun!` (an upload before the first run would go to the
+# task's own queue, unordered against the replay). Idempotent.
+adopt!(d::MetalDevice) = (Metal.adopt_queue!(d.dev, batchqueue(d)); d)
 
-# The Mantle device of a KernelAbstractions backend; a backend bound to a channel
-# belongs to the device that handed the channel out.
+# The Mantle device of Metal.jl's backend, which is what `KA.get_backend` of an
+# `MtlArray` returns; a backend bound to a channel belongs to the device that
+# handed the channel out.
 Device(b::Metal.MetalBackend) = b.queue === nothing ? Device(MetalAPI()) : deviceof(b.queue)
+
+# A backend's `==` is "the same device": Raycore refuses to adapt a TLAS to another
+# device's backend, and an `MtlArray` reports Metal.jl's backend for the device it
+# lives on. `isequal` stays identity, so hashing asks nothing of Metal.jl's type.
+Base.:(==)(b::Metal.MetalBackend, d::MetalDevice) = Device(b) === d
+Base.:(==)(d::MetalDevice, b::Metal.MetalBackend) = b == d
+Base.isequal(::Metal.MetalBackend, ::MetalDevice) = false
+Base.isequal(::MetalDevice, ::Metal.MetalBackend) = false
 pool(d::MetalDevice) = d.pool
-backend(::MetalDevice) = Metal.MetalBackend()
+
+"""
+    metalbackend(dev) -> Metal.MetalBackend
+
+Metal.jl's backend bound to `dev`'s batch, which the device's KernelInterface
+methods (`metal/kernelinterface.jl`) forward to: a launch goes to `dev`'s queue
+from any task, where an unbound `MetalBackend()` uses the calling task's own
+queue, with a residency set of its own.
+"""
+metalbackend(d::MetalDevice) = Metal.MetalBackend(batchqueue(d))
 
 # A Metal constraint is a storage mode: an `MTLBuffer` has no usage flags, so
 # nothing else limits sharing. It is a Metal.jl type (`Metal.SharedStorage`, what
@@ -171,6 +175,7 @@ array over the bytes.
 constraintof(::MetalDevice, ::Buffers, ts) = Metal.SharedStorage
 constraintof(::MetalDevice, ::Images, ts) = Metal.PrivateStorage
 constraintof(::MetalDevice, ::Persistent, ts) = Metal.SharedStorage
+constraintof(::MetalDevice, ::Mantle.Readback, ts) = Metal.SharedStorage
 
 """
 How accessible a storage mode is, as an order for [`compatible`](@ref) and
@@ -197,7 +202,7 @@ One device allocation for the pool to suballocate. `max(bytes, 1)` because
 Metal rejects a zero-length buffer and the pool may ask for an empty block.
 Throws `OutOfMemoryError` when Metal returns no buffer.
 """
-function rawalloc(d::MetalDevice, ::Union{Buffers,Persistent}, bytes::Int, storage)
+function rawalloc(d::MetalDevice, ::Union{Buffers,Persistent,Mantle.Readback}, bytes::Int, storage)
     mode = storage === nothing ? Metal.SharedStorage : storage
     buf = MTL.MTLBuffer(d.dev, max(bytes, 1); storage = mode)
     buf === nothing && throw(OutOfMemoryError())
@@ -280,7 +285,8 @@ rawfree(d::MetalDevice, heap::MTL.MTLHeap) =
 
 fence(d::MetalDevice) = fence(d.queue)
 passed(d::MetalDevice, f) = passed(d.queue, f)
-waitfor(d::MetalDevice, f) = waitfor(d.queue, f)
+issued(d::MetalDevice) = issued(d.queue)
+awaittoken!(d::MetalDevice, f::UInt64) = awaittoken!(d.queue, f)
 
 # Asking a `LegacyQueue` for a fence advances it, except on a quiet queue: there
 # every retirement is done, so the fence returned has already passed and a region
@@ -306,17 +312,11 @@ end
 
 passed(q::LegacyQueue, f) = UInt64(f) <= q.completed
 
-"""
-Wait for the timeline to reach `f` and return `true`, or return `false` when
-`f > next`: that value belongs to work not yet submitted, and the caller (an
-allocation) grows the pool instead of deadlocking.
-"""
-function waitfor(q::LegacyQueue, f)
-    passed(q, f) && return true
-    UInt64(f) > q.next && return false
-    waitidle(q)
-    return true
-end
+# Every fence handed out is covered by a drain: a value past `next` belongs to
+# work not yet submitted, and the caller (an allocation) grows the pool instead
+# of deadlocking.
+issued(q::LegacyQueue) = q.next
+awaittoken!(q::LegacyQueue, ::UInt64) = waitidle(q)
 
 """
 Drain the queue and mark every fence handed out before the wait as passed.
@@ -326,9 +326,9 @@ failed command buffer or device-side exception. Not `Metal.synchronize()`, which
 waits on the current task's queue, a different one for a device selected by name.
 """
 function waitidle(q::LegacyQueue)
-    issued = q.next
+    upto = q.next
     Metal.synchronize(q.bq)
-    q.completed = max(q.completed, issued)
+    q.completed = max(q.completed, upto)
     return nothing
 end
 
@@ -449,7 +449,7 @@ mutable struct MTL4Queue
     # How a failed submission is reported: MTL4 command buffers carry no error,
     # so without it a fault is a `waitfor` that never returns.
     feedback::MTL.MTL4Feedback
-    # `mtl`'s residency set, also given to this queue; `adoptqueue!` makes Metal.jl
+    # `mtl`'s residency set, also given to this queue; `adopt!` makes Metal.jl
     # use it too. A replay reaching memory outside it reads zeros and drops writes
     # silently, and `MTL_SHADER_VALIDATION=1` hides that by making all resident.
     resset::Union{Nothing,MTL.MTLResidencySet}
@@ -746,27 +746,46 @@ function passed(q::MTL4Queue, f)
     return UInt64(f) <= q.next || quiet(q)
 end
 
+# Nothing hands out more than `next + 1`: the legacy side's pending work.
+issued(q::MTL4Queue) = q.next + UInt64(1)
+
 """
 Wait on the shared event for `min(f, next)`, or for a `flushlegacy!` value when
-`f` is past `next` and legacy work is pending; return `false` for a token past
-`next + 1`. Throws when the MTL4 feedback reports a failed submission.
+`f` is past `next` and legacy work is pending. Throws when the MTL4 feedback
+reports a failed submission.
 """
-function waitfor(q::MTL4Queue, f)
-    passed(q, f) && return true
-    # Nothing hands out more than `next + 1`.
-    UInt64(f) > q.next + UInt64(1) && return false
-    target = UInt64(f) > q.next && !quiet(q) ? flushlegacy!(q) : min(UInt64(f), q.next)
+function awaittoken!(q::MTL4Queue, f::UInt64)
+    target = f > q.next && !quiet(q) ? flushlegacy!(q) : min(f, q.next)
     # Bounded waits in a loop so a failed submission is reported, not waited on
     # forever. Not a timeout: healthy work is waited for as long as it takes.
-    while !MTL.waitUntilSignaledValue(q.event, target, UInt64(1000))
+    w = EventWait(Base.unsafe_convert(id{MTL.MTLSharedEvent}, q.event), target, UInt64(1000))
+    while true
+        r = hostwait(blockon, w -> q.event.signaledValue >= w.target, w)
+        (r === nothing || something(r)) && return true
         why = MTL.failure(q.feedback)
-        why === nothing && continue
-        error("Mantle: a Metal 4 submission failed, so the timeline stopped at " *
-              "$(q.event.signaledValue) and value $target will never arrive. " *
-              "The driver says: $why")
+        why === nothing || error("Mantle: a Metal 4 submission failed, so the timeline " *
+            "stopped at $(q.event.signaledValue) and value $target will never arrive. " *
+            "The driver says: $why")
     end
-    return true
+    return nothing
 end
+
+"""
+One bounded wait for a Metal 4 queue's shared event to reach `target`, as a worker
+thread performs it (`hostwait`): `true` once it did, `false` after `timeout`
+milliseconds. The event by handle, so the wait is a bits type and handing it over
+boxes nothing; the queue, which keeps the event alive, stays with the waiting task,
+and so does the check for a failed submission.
+"""
+struct EventWait
+    event::id{MTL.MTLSharedEvent}
+    target::UInt64
+    timeout::UInt64
+end
+
+# On the worker; an `@objc` call blocks GC-safely.
+blockon(w::EventWait) = @objc [w.event::id{MTL.MTLSharedEvent} waitUntilSignaledValue:w.target::UInt64
+                                                                  timeoutMS:w.timeout::UInt64]::Bool
 
 """
     ownflush!(dev, own::Bool)
@@ -836,12 +855,6 @@ The device's batch, where launches, blits and walked passes go. Never
 batchqueue(d::MetalDevice) = batchqueue(d.queue)
 batchqueue(q::LegacyQueue) = q.bq
 
-"""
-Make this device's batch the one Metal.jl launches on for the running task (a
-task-local store). Called at the head of every run.
-"""
-adoptqueue!(d::MetalDevice) = (Metal.adopt_queue!(d.dev, batchqueue(d)); nothing)
-
 devicename(d::MetalDevice) = String(d.dev.name)
 """The largest single `MTLBuffer` this device will create."""
 maxalloc(d::MetalDevice) = Int(d.dev.maxBufferLength)
@@ -853,7 +866,6 @@ bound the placer checks against, not a reservation.
 capacity(d::MetalDevice) = Int(d.dev.recommendedMaxWorkingSetSize)
 
 """Wait for everything submitted to the device: its queue and every channel."""
-waitidle(b::Metal.MetalBackend) = waitidle(Device(b))
 waitidle(d::MetalDevice) = (waitidle(d.queue); foreach(Metal.synchronize, d.channels); nothing)
 
 # Both queues, the MTL4 one through the timeline so the pool sees what passed.
@@ -865,62 +877,53 @@ waitidle(q::MTL4Queue) = (waitfor(q, q.next); Metal.synchronize(q.bq); nothing)
 # unordered against each other; a buffer used on two is ordered by Metal.jl's
 # ownership check, a host wait for the other queue before each launch and copy.
 
-supports_batch_queue(::Union{Metal.MetalBackend,MetalDevice}) = true
+supports_batch_queue(::MetalDevice) = true
 
-function allocate_batch_queue!(d::MetalDevice)
-    refuseretired(d)
+function newchannel(d::MetalDevice)
     mtl = MTL.MTLCommandQueue(d.dev)
     mtl.label = "Mantle channel"
     bq = Metal.BatchedCommandQueue(mtl)
     pinpipeline!(bq)
-    push!(d.channels, bq)
     return bq
 end
-allocate_batch_queue!(b::Metal.MetalBackend) = allocate_batch_queue!(Device(b))
 
-"""
-The live device that handed `bq` out or owns it as its queue. Throws when none does.
-"""
+# A Metal.jl queue does not know its device.
 function deviceof(bq::Metal.BatchedCommandQueue)
-    for r in METAL.live
-        d = r.value
-        d isa MetalDevice || continue
-        (batchqueue(d) === bq || any(c -> c === bq, d.channels)) && return d
-    end
-    throw(ArgumentError("Mantle: this Metal queue belongs to no device: it was " *
-                        "released, or was never handed out by `allocate_batch_queue!`."))
+    d = ownerof(bq)
+    d === nothing && throw(ArgumentError(
+        "Mantle: this Metal queue belongs to no device: it was released, or was never " *
+        "handed out by `allocate_batch_queue!`."))
+    return d
 end
 todevice(bq::Metal.BatchedCommandQueue) = deviceof(bq)
 
-backend(bq::Metal.BatchedCommandQueue) = Metal.MetalBackend(bq)
-
 """Wait for everything submitted on `bq`, committing what is open first."""
 flush!(bq::Metal.BatchedCommandQueue) = (Metal.synchronize(bq); nothing)
+
+"""What a one-shot on a Metal queue records into: the queue's open batch, one serial compute
+encoder, so the block's launches run in order without a barrier between them."""
+struct MetalImmediate{Q<:Metal.BatchedCommandQueue}
+    bq::Q
+end
+
+# Core's one-shot (`graph/lifetime.jl`) on Metal.jl's queue, which holds what its launches
+# use until they complete: no hold frame and no token, the block's work is committed.
+function oneshot!(f, bq::Metal.BatchedCommandQueue; tag = nothing)
+    f(MetalImmediate(bq))
+    Metal.flush!(bq)
+    return nothing
+end
+
+Mantle.emitkernel!(e::MetalImmediate, f, args...; ndrange, workgroup_size) =
+    KI.Kernel(Metal.MetalBackend(e.bq), f)(args...; ndrange, workgroupsize = prod(workgroup_size))
 
 """Nothing is retired onto a Metal channel (arrays go back through Metal.jl,
 regions through the pool), so there is nothing to destroy."""
 reclaim!(::Metal.BatchedCommandQueue) = 0
 
-"""
-Drain `bq` and give it back. Releasing twice is a no-op; the device's own queue is
-refused, as core's contract for `release_batch_queue!` says.
-"""
-function release_batch_queue!(bq::Metal.BatchedCommandQueue)
-    for r in METAL.live
-        d = r.value
-        d isa MetalDevice || continue
-        batchqueue(d) === bq && throw(ArgumentError(
-            "Mantle: this is the device's own queue, which is not released; only a " *
-            "channel from `allocate_batch_queue!` is."))
-        i = findfirst(c -> c === bq, d.channels)
-        i === nothing && continue
-        Metal.synchronize(bq)
-        d.releasedsubmits += MTL.committed(bq.queue)
-        deleteat!(d.channels, i)
-        return nothing
-    end
-    return nothing
-end
+# Its committed command buffers still count towards `submissions`.
+closechannel!(d::MetalDevice, bq::Metal.BatchedCommandQueue) =
+    (d.releasedsubmits += MTL.committed(bq.queue); nothing)
 
 # The lifecycle verbs of `runtime/lifecycle.jl`.
 
@@ -936,20 +939,9 @@ submissions(q::MTL4Queue) = MTL.committed(q.mtl) - q.bridges + q.commits
 retire!(d::MetalDevice) = (d.retired = true; nothing)
 retired(d::MetalDevice) = d.retired
 
-"""
-    reset_device!(d::MetalDevice; debug = d.debug) -> MetalDevice
-
-Retire `d` and build a device on the same `MTLDevice`: a new queue of the same
-generation, a new pool. The default device's replacement becomes the default and
-adopts the queue. Nothing waits for `d`'s queue: a reset is also how a caller
-recovers from a queue whose command buffers failed.
-"""
-function reset_device!(d::MetalDevice; debug::DebugConfig = d.debug)
-    new = MetalDevice(d.dev, typeof(d.queue)(d.dev), debug)
-    retire!(d)
-    METAL.default === d && defaultdevice!(new)
-    return new
-end
+# A new queue of the same generation, a new pool. Nothing waits for `d`'s queue: a
+# reset is also how a caller recovers from a queue whose command buffers failed.
+remakedevice(d::MetalDevice, debug::DebugConfig) = MetalDevice(d.dev, typeof(d.queue)(d.dev), debug)
 
 """
 The array, or `nothing` when Metal has no memory for it. Allocates the `MTLBuffer`

@@ -5,107 +5,184 @@
 """
     build_accel!(f, queue) -> f(ctx)
 
-Run `f(ctx)` with the backend's build context ([`AccelBuildContext`](@ref) on
-Vulkan) and return its result. The builds recorded through `ctx` have completed and
-their scratch is released when this returns.
+Run `f(ctx)` with an [`AccelBuildContext`](@ref) over `queue` and return its result.
+The builds recorded through `ctx` run after the work submitted to `queue` before, and
+have completed with their scratch released when this returns.
 """
 function build_accel! end
 
 """
-    build_blas(ctx, vertices, indices; opaque = true, allow_update = false) -> BLAS
+    AccelStructure
 
-A bottom-level structure over triangles: `vertices` a `Vector{NTuple{3,Float32}}`,
-`indices` a `Vector{UInt32}` of zero-based vertex indices, three per triangle.
+A backend's built acceleration structure, bottom level (`build_blas`,
+`build_blas_aabb`) or top level (`build_tlas`).
+"""
+abstract type AccelStructure end
+
+# What a build reads, as device arrays ([`inputarray`](@ref)) in core's types: the
+# validation and the uploads before a backend's `buildnative!` are written once.
+struct TriangleInput{V,I}
+    vertices::V   # `NTuple{3,Float32}` positions
+    indices::I    # zero-based `UInt32` vertex indices, three per triangle
+end
+struct BoxInput{A}
+    boxes::A      # `AABB`s
+end
+struct InstanceInput{R,B}
+    records::R    # driver instance records (`nativerecords`)
+    n::Int
+    blases::B     # what the records name
+end
+
+"""
+    inputarray(device, T, n) -> device array
+
+`n` uninitialised elements of `T` a build reads in place: vertices, indices or boxes a
+kernel writes before `build_blas`/`build_blas_aabb`, or before `Raycore.refit!`.
+"""
+inputarray(device, ::Type{T}, n::Integer) where {T} = devicearray(device, T, Int(n))
+
+"""The device array a build reads `data` from: `data` itself when it is one
+([`inputarray`](@ref)), else an upload."""
+buildinput(device, data::AbstractVector) =
+    isdevicearray(data) ? data : copyto!(inputarray(device, eltype(data), length(data)), data)
+
+"""
+    buildnative!(ctx, input, allow_update) -> AccelStructure
+
+Build the backend's structure over `input` (a `TriangleInput`, `BoxInput` or
+`InstanceInput` of device arrays), refittable with `allow_update`. Its inputs are
+validated; the structure keeps the arrays it reads.
+"""
+function buildnative! end
+
+"""
+    refitnative!(ctx, as)
+
+Refit `as`, built refittable, in place from its inputs, which the caller rewrote.
+"""
+function refitnative! end
+
+"""
+    refittable(as) -> Bool
+
+Whether `as` was built with `allow_update = true`.
+"""
+function refittable end
+
+"""
+    refitinput(as) -> device array
+
+The input a refit of `as` reads: a bottom-level structure's vertices or boxes, a
+top-level structure's instance records.
+"""
+function refitinput end
+
+deviceof(ctx::AccelBuildContext) = deviceof(ctx.bq)
+
+"""
+    build_blas(ctx, vertices, indices; allow_update = false) -> AccelStructure
+
+A bottom-level structure over triangles: `vertices` `NTuple{3,Float32}` positions,
+`indices` zero-based `UInt32` vertex indices, three per triangle. A device array
+([`inputarray`](@ref)) is read in place, a host vector uploaded.
 
 `allow_update = true` makes it refittable through `Raycore.refit!(blas, vertices)`.
 Off by default because a driver may build a slower tree for it. Register it with
 `push!(tlas, blas, transform)`; its hits carry no triangle record (`closest_hit`
-returns the empty triangle), since only positions went in.
+returns the empty triangle), since only positions went in. Whether its hits are
+opaque is up to each instance (`opaque` at `push!`, `Raycore.set_opaque!`).
 """
-function build_blas end
+function build_blas(ctx::AccelBuildContext, vertices::AbstractVector{NTuple{3,Float32}},
+                    indices::AbstractVector{UInt32}; allow_update::Bool = false)
+    isempty(vertices) && throw(ArgumentError("build_blas: no vertices to build over"))
+    !isempty(indices) && length(indices) % 3 == 0 || throw(ArgumentError(
+        "build_blas: $(length(indices)) indices are not a whole, nonzero number of triangles"))
+    d = deviceof(ctx)
+    return buildnative!(ctx, TriangleInput(buildinput(d, vertices), buildinput(d, indices)), allow_update)
+end
 
 """
-    build_blas_aabb(ctx, aabbs; opaque = true) -> BLAS
+    build_blas_aabb(ctx, aabbs; allow_update = false) -> AccelStructure
 
 A bottom-level structure over procedural geometry: [`AABB`](@ref)s standing in for
 primitives the traversal cannot intersect itself. A ray entering a box is answered
 by the payload through `procedural_candidate` / `procedural_commit`
-(`raytracing/accel.jl`). Declared in core so a caller spells it the same on every
-backend. `opaque` is a hint a backend may ignore.
+(`raytracing/accel.jl`). A device array ([`inputarray`](@ref)) is read in place,
+and refit from with `Raycore.refit!(blas, boxes)` after `allow_update = true`.
 """
-function build_blas_aabb end
-
-"""
-    refit_tlas!(ctx, tlas, ...)
-
-Update `tlas` in place from rewritten instance records, same instance count;
-`ctx` is the backend's build context or device. It does not re-cluster: instances
-that move far degrade traversal until the structure is rebuilt.
-"""
-function refit_tlas! end
-
-"""
-    trace!(g, pipeline, accel, args, ndrange; name = nothing) -> pass
-
-Trace as a graph pass, ordered by what it reads and writes; the ray-tracing
-counterpart of [`dispatch!`](@ref). `ndrange` is a ray count or a
-[`DeviceRange`](@ref), and `args` live in the plan's argument memory, which makes a
-traced plan bakeable (see [`Trace`](@ref)). Accesses are inferred from `args` and
-from what every shader of the pipeline captures.
-
-    Mantle.trace!(g, rt_pipeline, accel, (queue_in, queue_out, film),
-                  Mantle.DeviceRange(n_rays))
-"""
-function trace!(g::Graph, pipeline, accel, args::Tuple, ndrange; name = nothing)
-    refuserefs(args)
-    p = newpass(g, name === nothing ? "trace" : String(name), :compute)
-    push!(passes(g), p)
-    h = handle(g, p)
-    declare!(h, args, kerneltouches(g.dev, pipeline, args, ndrange, nothing))
-    declare!(h, shaders(pipeline), shadertouches(g.dev, pipeline, args))
-    n = countresource(ndrange)
-    n === nothing || indirectcount!(h, n)
-    push!(dispatches(p), Trace(pipeline, accel, args, ndrange))
-    # Every usage of this pass is made at the ray-tracing stage (`Traced`), so
-    # retag them once all are declared.
-    for (i, (id, U)) in enumerate(p.usages)
-        p.usages[i] = id => traced(U)
-    end
-    return p
+function build_blas_aabb(ctx::AccelBuildContext, aabbs::AbstractVector{AABB}; allow_update::Bool = false)
+    d = deviceof(ctx)
+    supports_procedural_traversal(d) || throw(ArgumentError(
+        "build_blas_aabb: $(devicename(d)) cannot trace procedural geometry, so a box " *
+        "structure would never be intersected (`supports_procedural_traversal`)"))
+    isempty(aabbs) && throw(ArgumentError("build_blas_aabb: no boxes to build over"))
+    return buildnative!(ctx, BoxInput(buildinput(d, aabbs)), allow_update)
 end
 
 """
-    shaders(pipeline) -> Tuple
+    build_tlas(ctx, records, n; allow_update = false, blases) -> AccelStructure
 
-Every shader a trace runs, as closures; [`trace!`](@ref) declares what they
-capture through [`shadertouches`](@ref).
+A top-level structure over the first `n` driver instance records of `records`
+([`nativerecords`](@ref)), which name the bottom-level structures `blases` by
+[`geometryvalue`](@ref). The structure owns `records` from then on and holds
+`blases` for every trace of it. `allow_update = true` makes it refittable.
 """
-function shaders end
+function build_tlas(ctx::AccelBuildContext, records, n::Integer; allow_update::Bool = false,
+                    blases = blastype(deviceof(ctx))[])
+    0 <= n <= length(records) || throw(ArgumentError(
+        "build_tlas: $n instances, but $(length(records)) records"))
+    return buildnative!(ctx, InstanceInput(records, Int(n), blases), allow_update)
+end
+
+function refusefixed(as, operation)
+    refittable(as) || throw(ArgumentError(
+        "$operation: the structure was built with allow_update = false; rebuild it, " *
+        "or build it with allow_update = true"))
+    return nothing
+end
 
 """
-    shadertouches(device, pipeline, args) -> Vector{Touch}
+    refit_tlas!(ctx, tlas)
 
-What each of `shaders(pipeline)` does to its own captured state, in the same
-order. A shader that captures nothing answers `NOTOUCH`.
+Update `tlas`, built with `allow_update = true`, in place from the records it was
+built from, which the caller rewrote. It does not re-cluster: instances that move
+far degrade traversal until the structure is rebuilt.
 """
-function shadertouches end
+function refit_tlas!(ctx::AccelBuildContext, tlas::AccelStructure)
+    refusefixed(tlas, "refit_tlas!")
+    return refitnative!(ctx, tlas)
+end
+
+# What a refit writes into a structure's input: positions as `NTuple{3,Float32}`, boxes as they are.
+refitdata(::Type{NTuple{3,Float32}}, v::AbstractVector{NTuple{3,Float32}}) = v
+refitdata(::Type{NTuple{3,Float32}}, v::AbstractVector{<:StaticVector{3}}) =
+    NTuple{3,Float32}[Tuple(Float32.(p)) for p in v]
+refitdata(::Type{AABB}, boxes::AbstractVector{AABB}) = boxes
+refitdata(::Type{T}, x::AbstractVector) where {T} = throw(ArgumentError(
+    "refit!: the structure was built over $T, not $(eltype(x))"))
 
 """
-    supports_rt_pipeline(x) -> Bool
+    Raycore.refit!(blas::AccelStructure, input) -> blas
 
-Whether tracing can use a ray-tracing pipeline (shader binding table plus
-trace-rays command) rather than an inline ray query in a compute kernel. Both
-traverse in hardware; Metal has no SBT and calls its intersector from the shading
-kernel. `false` unless a backend opts in. Accepts a device, a backend, an `HWTLAS`
-or an [`AdaptedAccel`](@ref).
+Move a bottom-level structure built with `allow_update = true` in place: `input` holds
+the new vertices (positions) or boxes, as many as it was built over, on the host or
+the device. A refit keeps the topology and does not re-cluster; rebuild for a
+different mesh or after large motion. Refit every TLAS naming it afterwards.
 """
-supports_rt_pipeline(::Any) = false
-# A device answers what its backend answers, as `supports_graphics` does.
-supports_rt_pipeline(dev::Device) = supports_rt_pipeline(backend(dev))
-# Procedural geometry forces the inline path: a pipeline would need an
-# intersection shader in a `PROCEDURAL_HIT_GROUP`, which is not wired.
-supports_rt_pipeline(a::AdaptedAccel) =
-    a.procedural === nothing && supports_rt_pipeline(a.hwtlas)
+function Raycore.refit!(blas::AccelStructure, input::AbstractVector)
+    refusefixed(blas, "refit!")
+    target = refitinput(blas)
+    data = refitdata(eltype(target), input)
+    length(data) == length(target) || throw(ArgumentError(
+        "refit!: $(length(data)) elements for a structure built over $(length(target)); " *
+        "a refit keeps the topology, rebuild for a different one"))
+    data === target || copyto!(target, data)
+    build_accel!(batchqueue(deviceof(blas))) do ctx
+        refitnative!(ctx, blas)
+    end
+    return blas
+end
 
 """
     supports_procedural_traversal(x) -> Bool
@@ -117,7 +194,6 @@ building a BLAS over the boxes. A backend opts in by implementing
 by name, not as a `MethodError` inside a shader compile.
 """
 supports_procedural_traversal(::Any) = false
-supports_procedural_traversal(dev::Device) = supports_procedural_traversal(backend(dev))
 
 # Callers usually hold the adapted accel; the `::Any` default would answer a wrong `false`.
 supports_procedural_traversal(a::AdaptedAccel) = supports_procedural_traversal(a.hwtlas)
@@ -131,7 +207,6 @@ ordinary kernel (Vulkan ray query, Metal intersector). Ask before
 unless a backend opts in.
 """
 supports_hwtlas(::Any) = false
-supports_hwtlas(dev::Device) = supports_hwtlas(backend(dev))
 
 # No pinning verb: a submission's payload holds what its command buffers pinned
 # (`Outstanding` in `graph/submission.jl`).
